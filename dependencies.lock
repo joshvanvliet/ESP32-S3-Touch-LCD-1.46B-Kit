@@ -1,0 +1,45 @@
+dependencies:
+  chmorgan/esp-audio-player:
+    dependencies: []
+    source:
+      path: E:\CodeAlgemeen\ESP-Assistant\ESP32-S3-Touch-LCD-1.46B-Kit\components\chmorgan__esp-audio-player
+      type: local
+    version: 1.0.7
+  chmorgan/esp-libhelix-mp3:
+    dependencies: []
+    source:
+      path: E:\CodeAlgemeen\ESP-Assistant\ESP32-S3-Touch-LCD-1.46B-Kit\components\chmorgan__esp-libhelix-mp3
+      type: local
+    version: 1.0.3
+  espressif/esp-dsp:
+    dependencies: []
+    source:
+      path: E:\CodeAlgemeen\ESP-Assistant\ESP32-S3-Touch-LCD-1.46B-Kit\components\espressif__esp-dsp
+      type: local
+    version: 1.4.12
+  espressif/esp-sr:
+    dependencies: []
+    source:
+      path: E:\CodeAlgemeen\ESP-Assistant\ESP32-S3-Touch-LCD-1.46B-Kit\components\espressif__esp-sr
+      type: local
+    version: 1.9.4
+  idf:
+    source:
+      type: idf
+    version: 5.3.5
+  lvgl/lvgl:
+    dependencies: []
+    source:
+      path: E:\CodeAlgemeen\ESP-Assistant\ESP32-S3-Touch-LCD-1.46B-Kit\components\lvgl__lvgl
+      type: local
+    version: 8.3.11
+direct_dependencies:
+- chmorgan/esp-audio-player
+- chmorgan/esp-libhelix-mp3
+- espressif/esp-dsp
+- espressif/esp-sr
+- idf
+- lvgl/lvgl
+manifest_hash: bfd712c1bbe40a43339ac7b51b0ebc10ccfcee99cd574ab9e26662d2ddbcf7c8
+target: esp32s3
+version: 2.0.0

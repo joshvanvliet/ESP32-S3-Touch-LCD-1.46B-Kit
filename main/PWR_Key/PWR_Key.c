@@ -3,6 +3,7 @@
 static uint8_t BAT_State = 0; 
 static uint8_t Device_State = 0; 
 static uint16_t Long_Press = 0;
+static pwr_short_press_cb_t s_short_press_cb = NULL;
 
 
 void PWR_Loop(void)
@@ -22,9 +23,15 @@ void PWR_Loop(void)
       }
     }
     else{
+      uint16_t released_press = Long_Press;
       if(BAT_State == 1)   
         BAT_State = 2;
       Long_Press = 0;
+      if (released_press > 0 &&
+          released_press < Device_Sleep_Time &&
+          s_short_press_cb) {
+        s_short_press_cb();
+      }
     }
   }
 }
@@ -56,4 +63,9 @@ void PWR_Init(void) {
     BAT_State = 1;               
     gpio_set_level(PWR_Control_PIN, true);
   }
+}
+
+void PWR_RegisterShortPressCallback(pwr_short_press_cb_t callback)
+{
+  s_short_press_cb = callback;
 }

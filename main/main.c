@@ -6,23 +6,34 @@
 #include "BAT_Driver.h"
 #include "PWR_Key.h"
 #include "PCM5101.h"
-#include "MIC_Speech.h"
 #include "LVGL_Driver.h"
-#include "starter_ui.h"
+#include "app_state.h"
+#if CONFIG_APP_WAKEWORD_ENABLED
+#include "MIC_Speech.h"
+#endif
 
 #include "esp_log.h"
+#include "nvs_flash.h"
 
-static const char *TAG = "STARTER";
+static const char *TAG = "APP";
 
 static void driver_loop(void *parameter)
 {
     (void)parameter;
+    uint8_t slow_div = 0;
+
     while (1) {
-        QMI8658_Loop();
-        PCF85063_Loop();
-        BAT_Get_Volts();
         PWR_Loop();
-        vTaskDelay(pdMS_TO_TICKS(100));
+
+        slow_div++;
+        if (slow_div >= 5) {
+            slow_div = 0;
+            QMI8658_Loop();
+            PCF85063_Loop();
+            BAT_Get_Volts();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
@@ -38,7 +49,7 @@ static void driver_init(void)
 
     xTaskCreatePinnedToCore(
         driver_loop,
-        "starter_driver",
+        "driver_loop",
         4096,
         NULL,
         3,
@@ -48,32 +59,32 @@ static void driver_init(void)
 
 void app_main(void)
 {
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
     ESP_LOGI(TAG, "Initializing board peripherals");
     driver_init();
 
     LCD_Init();
     LVGL_Init();
-
-    // Speaker and microphone bring-up
     Audio_Init();
+#if CONFIG_APP_WAKEWORD_ENABLED
     MIC_Speech_init();
+#endif
 
-    // Short startup chirp on speaker for quick audio sanity-check
-    Audio_Play_Test_Tone(1000, 120);
-    vTaskDelay(pdMS_TO_TICKS(80));
-    Audio_Play_Test_Tone(1400, 120);
+    Audio_Play_Test_Tone(1000, 100);
+    vTaskDelay(pdMS_TO_TICKS(60));
+    Audio_Play_Test_Tone(1400, 100);
 
-    starter_ui_init();
+    ESP_ERROR_CHECK(app_state_init());
 
-    TickType_t last_ui_update = xTaskGetTickCount();
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(10));
         lv_timer_handler();
-
-        TickType_t now = xTaskGetTickCount();
-        if ((now - last_ui_update) >= pdMS_TO_TICKS(250)) {
-            starter_ui_update(BAT_Get_Volts(), &datetime, &Accel, LCD_Backlight);
-            last_ui_update = now;
-        }
+        app_state_process();
     }
 }

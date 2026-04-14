@@ -1,6 +1,10 @@
 idf_component_register(
     SRCS
         "./main.c"
+        "./app_audio_capture.c"
+        "./app_ble_link.c"
+        "./app_state.c"
+        "./app_ui.c"
         "./starter_ui.c"
         "./EXIO/TCA9554PWR.c"
         "./Audio_Driver/PCM5101.c"
@@ -36,4 +40,6 @@ idf_component_register(
         "fatfs"
         "bt"
         "spi_flash"
+    PRIV_REQUIRES
+        "nvs_flash"
 )
