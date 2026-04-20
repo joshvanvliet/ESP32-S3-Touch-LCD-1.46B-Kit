@@ -58,7 +58,7 @@ static void app_ui_apply_state(void)
         case APP_STATE_READY:
             lv_label_set_text(s_status_chip, "Ready");
             lv_label_set_text(s_primary_btn_label, "Tap to Talk");
-            lv_label_set_text(s_hint, "Audio streams to phone");
+            lv_label_set_text(s_hint, "Ready to capture");
             lv_obj_clear_state(s_primary_btn, LV_STATE_DISABLED);
             lv_obj_clear_flag(s_primary_btn, LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(s_arc, LV_OBJ_FLAG_HIDDEN);
@@ -78,7 +78,7 @@ static void app_ui_apply_state(void)
         case APP_STATE_UPLOADING:
             lv_label_set_text(s_status_chip, "Uploading");
             lv_label_set_text(s_primary_btn_label, "Waiting...");
-            lv_label_set_text(s_hint, "Transcribing on phone");
+            lv_label_set_text(s_hint, "Finalizing transcript on phone");
             lv_obj_add_state(s_primary_btn, LV_STATE_DISABLED);
             lv_obj_clear_flag(s_primary_btn, LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(s_arc, LV_OBJ_FLAG_HIDDEN);

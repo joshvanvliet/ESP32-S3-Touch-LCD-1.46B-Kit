@@ -8,8 +8,9 @@
 #define APP_GATT_EVENT_UUID   "7f5a0003-5d7f-4f51-9ed4-30f4b6d90000"
 #define APP_GATT_AUDIO_UUID   "7f5a0004-5d7f-4f51-9ed4-30f4b6d90000"
 #define APP_GATT_RESULT_UUID  "7f5a0005-5d7f-4f51-9ed4-30f4b6d90000"
+#define APP_GATT_AUDIO_DOWNLINK_UUID "7f5a0006-5d7f-4f51-9ed4-30f4b6d90000"
 
-#define APP_PROTOCOL_VERSION 0x02
+#define APP_PROTOCOL_VERSION 0x03
 
 #define APP_AUDIO_CODEC_IMA_ADPCM_16K 0x01
 #define APP_AUDIO_CODEC_IMA_ADPCM_12K 0x02
@@ -23,6 +24,7 @@
 #define APP_AUDIO_MAX_SAMPLE_RATE APP_AUDIO_SAMPLE_RATE_16K
 #define APP_AUDIO_MAX_PCM_SAMPLES_PER_FRAME ((APP_AUDIO_MAX_SAMPLE_RATE * APP_AUDIO_FRAME_MS) / 1000)
 #define APP_AUDIO_MAX_ADPCM_BYTES (APP_AUDIO_MAX_PCM_SAMPLES_PER_FRAME / 2)
+#define APP_AUDIO_DOWNLINK_MAX_ADPCM_BYTES 180
 
 typedef enum {
     APP_STATE_UNPAIRED = 0,
@@ -56,6 +58,9 @@ typedef enum {
     APP_EVT_CAPTURE_STOPPED = 0x83,
     APP_EVT_ERROR = 0x84,
     APP_EVT_PAIRING_PASSKEY = 0x85,
+    APP_EVT_AGENT_STATUS = 0x86,
+    APP_EVT_AUDIO_DOWNLINK_READY = 0x87,
+    APP_EVT_AUDIO_DOWNLINK_DONE = 0x88,
 } app_event_opcode_t;
 
 typedef struct __attribute__((packed)) {
@@ -73,6 +78,14 @@ typedef struct __attribute__((packed)) {
     uint8_t text_len;
     char text[APP_MAX_TRANSCRIPT_BYTES];
 } app_transcript_payload_t;
+
+typedef struct __attribute__((packed)) {
+    uint16_t session_id;
+    uint16_t seq;
+    uint8_t flags;
+    uint8_t codec;
+    uint16_t payload_len;
+} app_audio_downlink_packet_header_t;
 
 typedef struct __attribute__((packed)) {
     uint8_t opcode;

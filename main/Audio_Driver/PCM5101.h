@@ -44,6 +44,7 @@ extern bool Music_Next_Flag;
 extern uint8_t Volume;
 void Audio_Init(void);
 void Audio_Play_Test_Tone(uint16_t freq_hz, uint16_t duration_ms);
+bool Audio_Play_PCM16_Mono(const int16_t *samples, size_t sample_count, uint32_t sample_rate_hz);
 void Play_Music(const char* directory, const char* fileName);
 void Music_resume(void);
 void Music_pause(void);

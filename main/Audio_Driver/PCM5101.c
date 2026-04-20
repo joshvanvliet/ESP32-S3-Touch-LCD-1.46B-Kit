@@ -5,28 +5,43 @@ static const char *TAG = "AUDIO PCM5101";
 
 static i2s_chan_handle_t i2s_tx_chan; 
 static i2s_chan_handle_t i2s_rx_chan; 
+static uint32_t s_pcm_tx_rate_hz;
+static bool s_pcm_tx_stereo_mode;
+static SemaphoreHandle_t s_tx_mutex;
+
+#define AUDIO_TX_LOCK_TIMEOUT_TICKS pdMS_TO_TICKS(450)
+#define AUDIO_TX_WRITE_TIMEOUT_TICKS pdMS_TO_TICKS(320)
+#define AUDIO_TX_WRITE_PROGRESS_RETRY_LIMIT 16
+#define AUDIO_PCM_MONO_CHUNK 128
+
+static int16_t s_pcm_stereo_buf[AUDIO_PCM_MONO_CHUNK * 2];
 
 uint8_t Volume = Volume_MAX - 2;
 bool Music_Next_Flag = 0;
-// static esp_err_t bsp_i2s_write(void *audio_buffer, size_t len, size_t *bytes_written, uint32_t timeout_ms) {                     // I2S Write Init
-//     return i2s_channel_write(i2s_tx_chan, (char *)audio_buffer, len, bytes_written, timeout_ms);
-// }
-static esp_err_t bsp_i2s_write(void *audio_buffer, size_t len, size_t *bytes_written, uint32_t timeout_ms) {
-    int16_t *samples = (int16_t *)audio_buffer;
-    size_t sample_count = len / sizeof(int16_t);
-    
-    // Calculate the volume scaling factor to convert the volume level from 0-100 to the 0.0-1.0 range
-    float volume_factor = Volume / 100.0f;
-
-
-    for (size_t i = 0; i < sample_count; i++) {
-        samples[i] = (int16_t)(samples[i] * volume_factor);
+static bool audio_tx_lock(void)
+{
+    if (s_tx_mutex == NULL) {
+        return false;
     }
-
-    return i2s_channel_write(i2s_tx_chan, (char *)audio_buffer, len, bytes_written, timeout_ms);
+    return xSemaphoreTake(s_tx_mutex, AUDIO_TX_LOCK_TIMEOUT_TICKS) == pdTRUE;
 }
-static esp_err_t bsp_i2s_reconfig_clk(uint32_t rate, uint32_t bits_cfg, i2s_slot_mode_t ch) {                                   // I2S Init
-    esp_err_t ret = ESP_OK; 
+
+static void audio_tx_unlock(void)
+{
+    if (s_tx_mutex) {
+        xSemaphoreGive(s_tx_mutex);
+    }
+}
+
+static void audio_tx_update_format(uint32_t rate, i2s_slot_mode_t ch)
+{
+    s_pcm_tx_rate_hz = rate;
+    s_pcm_tx_stereo_mode = (ch == I2S_SLOT_MODE_STEREO);
+}
+
+static esp_err_t audio_tx_reconfig_locked(uint32_t rate, uint32_t bits_cfg, i2s_slot_mode_t ch)
+{
+    esp_err_t ret = ESP_OK;
     i2s_std_config_t std_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(rate),
         .slot_cfg = I2S_STD_PHILIP_SLOT_DEFAULT_CONFIG((i2s_data_bit_width_t)bits_cfg, ch),
@@ -35,8 +50,93 @@ static esp_err_t bsp_i2s_reconfig_clk(uint32_t rate, uint32_t bits_cfg, i2s_slot
     ret |= i2s_channel_disable(i2s_tx_chan);
     ret |= i2s_channel_reconfig_std_clock(i2s_tx_chan, &std_cfg.clk_cfg);
     ret |= i2s_channel_reconfig_std_slot(i2s_tx_chan, &std_cfg.slot_cfg);
-    ret |= i2s_channel_enable(i2s_tx_chan); 
-    return ret; 
+    ret |= i2s_channel_enable(i2s_tx_chan);
+    if (ret == ESP_OK) {
+        audio_tx_update_format(rate, ch);
+    }
+    return ret;
+}
+
+static esp_err_t audio_tx_recover_locked(uint32_t rate)
+{
+    if (rate == 0) {
+        rate = s_pcm_tx_rate_hz > 0 ? s_pcm_tx_rate_hz : 8000;
+    }
+    ESP_LOGW(TAG, "Audio TX recover start rate=%lu", (unsigned long)rate);
+    esp_err_t ret = audio_tx_reconfig_locked(rate, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Audio TX recover failed: %s", esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG, "Audio TX recover ok rate=%lu", (unsigned long)rate);
+    }
+    return ret;
+}
+
+static esp_err_t audio_tx_write_all_locked(const int16_t *audio_buffer, size_t len, TickType_t timeout_ticks)
+{
+    const uint8_t *cursor = (const uint8_t *)audio_buffer;
+    size_t remaining = len;
+    int no_progress_retries = 0;
+
+    while (remaining > 0) {
+        size_t bytes_written = 0;
+        esp_err_t write_ret = i2s_channel_write(
+            i2s_tx_chan,
+            (void *)cursor,
+            remaining,
+            &bytes_written,
+            timeout_ticks);
+
+        if (bytes_written > 0) {
+            cursor += bytes_written;
+            remaining -= bytes_written;
+            no_progress_retries = 0;
+            continue;
+        }
+
+        no_progress_retries++;
+        if (write_ret != ESP_OK || no_progress_retries > AUDIO_TX_WRITE_PROGRESS_RETRY_LIMIT) {
+            return (write_ret == ESP_OK) ? ESP_ERR_TIMEOUT : write_ret;
+        }
+        vTaskDelay(1);
+    }
+    return ESP_OK;
+}
+
+static esp_err_t bsp_i2s_write(void *audio_buffer, size_t len, size_t *bytes_written, uint32_t timeout_ms)
+{
+    if (!audio_buffer || i2s_tx_chan == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    int16_t *samples = (int16_t *)audio_buffer;
+    size_t sample_count = len / sizeof(int16_t);
+    uint32_t volume = Volume;
+    for (size_t i = 0; i < sample_count; i++) {
+        samples[i] = (int16_t)(((int32_t)samples[i] * (int32_t)volume) / (int32_t)Volume_MAX);
+    }
+
+    if (!audio_tx_lock()) {
+        return ESP_ERR_TIMEOUT;
+    }
+    // audio_player passes timeout in FreeRTOS ticks (despite the field name).
+    esp_err_t ret = audio_tx_write_all_locked(samples, len, (TickType_t)timeout_ms);
+    audio_tx_unlock();
+
+    if (bytes_written) {
+        *bytes_written = (ret == ESP_OK) ? len : 0;
+    }
+    return ret;
+}
+
+static esp_err_t bsp_i2s_reconfig_clk(uint32_t rate, uint32_t bits_cfg, i2s_slot_mode_t ch)
+{
+    if (!audio_tx_lock()) {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t ret = audio_tx_reconfig_locked(rate, bits_cfg, ch);
+    audio_tx_unlock();
+    return ret;
 }
 
 static esp_err_t audio_mute_function(AUDIO_PLAYER_MUTE_SETTING setting) {                                                       // audio mute function
@@ -88,6 +188,11 @@ void Audio_Init(void)
         ESP_LOGE(TAG, "Failed to initialize audio: %s", esp_err_to_name(ret));
         return;
     }
+    s_tx_mutex = xSemaphoreCreateMutex();
+    if (!s_tx_mutex) {
+        ESP_LOGE(TAG, "Failed to create audio TX mutex");
+        return;
+    }
     audio_player_config_t config = { 
         .mute_fn = audio_mute_function,
         .write_fn = bsp_i2s_write,
@@ -114,6 +219,9 @@ void Audio_Init(void)
         ESP_LOGE(TAG, "Expected state to be IDLE");                 // The player is not idle
         return;
     }
+
+    s_pcm_tx_rate_hz = 44100;
+    s_pcm_tx_stereo_mode = true;
 }
 
 void Audio_Play_Test_Tone(uint16_t freq_hz, uint16_t duration_ms)
@@ -135,6 +243,22 @@ void Audio_Play_Test_Tone(uint16_t freq_hz, uint16_t duration_ms)
         return;
     }
 
+    if (!audio_tx_lock()) {
+        ESP_LOGW(TAG, "Audio test tone skipped (audio lock timeout)");
+        free(buffer);
+        return;
+    }
+
+    if (s_pcm_tx_rate_hz != (uint32_t)sample_rate || !s_pcm_tx_stereo_mode) {
+        esp_err_t cfg_ret = audio_tx_reconfig_locked((uint32_t)sample_rate, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO);
+        if (cfg_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Audio test tone reconfig failed: %s", esp_err_to_name(cfg_ret));
+            audio_tx_unlock();
+            free(buffer);
+            return;
+        }
+    }
+
     float phase = 0.0f;
     int generated = 0;
     while (generated < total_samples) {
@@ -153,19 +277,87 @@ void Audio_Play_Test_Tone(uint16_t freq_hz, uint16_t duration_ms)
             }
         }
 
-        size_t bytes_written = 0;
-        i2s_channel_write(
-            i2s_tx_chan,
-            buffer,
-            (size_t)count * 2 * sizeof(int16_t),
-            &bytes_written,
-            pdMS_TO_TICKS(100));
-
+        size_t bytes_to_write = (size_t)count * 2 * sizeof(int16_t);
+        esp_err_t write_ret = audio_tx_write_all_locked(buffer, bytes_to_write, AUDIO_TX_WRITE_TIMEOUT_TICKS);
+        if (write_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Audio test tone write failed: %s", esp_err_to_name(write_ret));
+            break;
+        }
         generated += count;
     }
 
+    audio_tx_unlock();
     free(buffer);
 }
+
+bool Audio_Play_PCM16_Mono(const int16_t *samples, size_t sample_count, uint32_t sample_rate_hz)
+{
+    if (samples == NULL || sample_count == 0 || i2s_tx_chan == NULL) {
+        return false;
+    }
+
+    if (sample_rate_hz == 0) {
+        sample_rate_hz = 8000;
+    }
+
+    if (!audio_tx_lock()) {
+        ESP_LOGW(TAG, "Audio_Play_PCM16_Mono lock timeout");
+        return false;
+    }
+
+    if (s_pcm_tx_rate_hz != sample_rate_hz || !s_pcm_tx_stereo_mode) {
+        esp_err_t clk_ret = audio_tx_reconfig_locked(sample_rate_hz, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO);
+        if (clk_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Audio_Play_PCM16_Mono reconfig failed: %s", esp_err_to_name(clk_ret));
+            audio_tx_unlock();
+            return false;
+        }
+    }
+
+    bool ok = true;
+
+    for (size_t offset = 0; offset < sample_count; offset += AUDIO_PCM_MONO_CHUNK) {
+        size_t chunk_samples = sample_count - offset;
+        if (chunk_samples > AUDIO_PCM_MONO_CHUNK) {
+            chunk_samples = AUDIO_PCM_MONO_CHUNK;
+        }
+        for (size_t i = 0; i < chunk_samples; ++i) {
+            int16_t s = samples[offset + i];
+            s_pcm_stereo_buf[(i * 2)] = s;
+            s_pcm_stereo_buf[(i * 2) + 1] = s;
+        }
+
+        size_t bytes_to_write = chunk_samples * 2 * sizeof(int16_t);
+        esp_err_t write_ret = audio_tx_write_all_locked(s_pcm_stereo_buf, bytes_to_write, AUDIO_TX_WRITE_TIMEOUT_TICKS);
+        if (write_ret != ESP_OK) {
+            ESP_LOGW(TAG,
+                     "Audio_Play_PCM16_Mono write failed: %s rate=%lu chunk_samples=%lu remaining_samples=%lu",
+                     esp_err_to_name(write_ret),
+                     (unsigned long)sample_rate_hz,
+                     (unsigned long)chunk_samples,
+                     (unsigned long)(sample_count - offset));
+            esp_err_t recover_ret = audio_tx_recover_locked(sample_rate_hz);
+            if (recover_ret != ESP_OK) {
+                ok = false;
+                break;
+            }
+            write_ret = audio_tx_write_all_locked(s_pcm_stereo_buf, bytes_to_write, AUDIO_TX_WRITE_TIMEOUT_TICKS);
+            if (write_ret != ESP_OK) {
+                ESP_LOGW(TAG,
+                         "Audio_Play_PCM16_Mono retry write failed: %s rate=%lu chunk_samples=%lu remaining_samples=%lu",
+                         esp_err_to_name(write_ret),
+                         (unsigned long)sample_rate_hz,
+                         (unsigned long)chunk_samples,
+                         (unsigned long)(sample_count - offset));
+                ok = false;
+                break;
+            }
+        }
+    }
+    audio_tx_unlock();
+    return ok;
+}
+
 void Play_Music(const char* directory, const char* fileName)
 {  
     Music_pause();

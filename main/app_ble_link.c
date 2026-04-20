@@ -67,6 +67,7 @@ typedef enum {
     APP_CHAR_EVENT = 1,
     APP_CHAR_AUDIO = 2,
     APP_CHAR_RESULT = 3,
+    APP_CHAR_AUDIO_DOWNLINK = 4,
 } app_ble_char_t;
 
 static const ble_uuid128_t s_service_uuid = BLE_UUID128_INIT(
@@ -88,6 +89,10 @@ static const ble_uuid128_t s_audio_uuid = BLE_UUID128_INIT(
 static const ble_uuid128_t s_result_uuid = BLE_UUID128_INIT(
     0x00, 0x00, 0xD9, 0xB6, 0xF4, 0x30, 0xD4, 0x9E,
     0x51, 0x4F, 0x7F, 0x5D, 0x05, 0x00, 0x5A, 0x7F);
+
+static const ble_uuid128_t s_audio_downlink_uuid = BLE_UUID128_INIT(
+    0x00, 0x00, 0xD9, 0xB6, 0xF4, 0x30, 0xD4, 0x9E,
+    0x51, 0x4F, 0x7F, 0x5D, 0x06, 0x00, 0x5A, 0x7F);
 
 static uint16_t app_le16_read(const uint8_t *p)
 {
@@ -251,7 +256,7 @@ static int app_ble_access_cb(
         return BLE_ATT_ERR_READ_NOT_PERMITTED;
     }
 
-    uint8_t buf[128];
+    uint8_t buf[APP_BLE_PACKET_MAX];
     uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
     if (len > sizeof(buf)) {
         len = sizeof(buf);
@@ -312,12 +317,15 @@ static int app_ble_access_cb(
                 break;
             default:
                 ESP_LOGW(TAG, "Unknown control opcode: 0x%02X", buf[0]);
-                break;
+                return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
         }
         return 0;
     }
 
     if (which == APP_CHAR_RESULT) {
+        if (!s_app_ready) {
+            return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
+        }
         if (len < 4) {
             return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
         }
@@ -337,6 +345,34 @@ static int app_ble_access_cb(
 
         if (s_callbacks.on_result_text) {
             s_callbacks.on_result_text(session_id, status, text);
+        }
+        return 0;
+    }
+
+    if (which == APP_CHAR_AUDIO_DOWNLINK) {
+        if (!s_app_ready) {
+            return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
+        }
+        if (len < sizeof(app_audio_downlink_packet_header_t)) {
+            return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        }
+
+        app_audio_downlink_packet_header_t header;
+        memcpy(&header, buf, sizeof(header));
+        if (header.payload_len > APP_AUDIO_DOWNLINK_MAX_ADPCM_BYTES) {
+            return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        }
+        if ((uint16_t)(sizeof(header) + header.payload_len) > len) {
+            return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        }
+
+        if (s_callbacks.on_audio_downlink_packet && header.payload_len > 0) {
+            s_callbacks.on_audio_downlink_packet(header.session_id,
+                                                 header.seq,
+                                                 header.flags,
+                                                 header.codec,
+                                                 &buf[sizeof(header)],
+                                                 header.payload_len);
         }
         return 0;
     }
@@ -373,6 +409,12 @@ static const struct ble_gatt_svc_def s_gatt_svcs[] = {
                 .uuid = &s_result_uuid.u,
                 .access_cb = app_ble_access_cb,
                 .arg = (void *)APP_CHAR_RESULT,
+                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
+            },
+            {
+                .uuid = &s_audio_downlink_uuid.u,
+                .access_cb = app_ble_access_cb,
+                .arg = (void *)APP_CHAR_AUDIO_DOWNLINK,
                 .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
             },
             {0},
@@ -781,6 +823,51 @@ void app_ble_link_notify_error(uint8_t error_code)
         return;
     }
     uint8_t payload[4] = {APP_EVT_ERROR, error_code, 0, 0};
+    app_ble_notify_raw(s_event_val_handle, payload, sizeof(payload));
+}
+
+void app_ble_link_notify_agent_status(uint8_t status, const char *detail)
+{
+    if (!s_event_notify_enabled) {
+        return;
+    }
+
+    uint8_t payload[64];
+    payload[0] = APP_EVT_AGENT_STATUS;
+    payload[1] = status;
+    uint8_t text_len = 0;
+    if (detail) {
+        size_t n = strlen(detail);
+        if (n > 60) {
+            n = 60;
+        }
+        text_len = (uint8_t)n;
+        memcpy(&payload[3], detail, text_len);
+    }
+    payload[2] = text_len;
+    app_ble_notify_raw(s_event_val_handle, payload, (uint16_t)(3 + text_len));
+}
+
+void app_ble_link_notify_audio_downlink_ready(uint8_t credits)
+{
+    if (!s_event_notify_enabled) {
+        return;
+    }
+    uint8_t payload[3] = {APP_EVT_AUDIO_DOWNLINK_READY, credits, 0};
+    app_ble_notify_raw(s_event_val_handle, payload, sizeof(payload));
+}
+
+void app_ble_link_notify_audio_downlink_done(uint16_t session_id, uint8_t status)
+{
+    if (!s_event_notify_enabled) {
+        return;
+    }
+    uint8_t payload[4] = {
+        APP_EVT_AUDIO_DOWNLINK_DONE,
+        (uint8_t)(session_id & 0xFF),
+        (uint8_t)((session_id >> 8) & 0xFF),
+        status,
+    };
     app_ble_notify_raw(s_event_val_handle, payload, sizeof(payload));
 }
 

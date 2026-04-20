@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "./main.c"
         "./app_audio_capture.c"
+        "./app_audio_downlink.c"
         "./app_ble_link.c"
         "./app_state.c"
         "./app_ui.c"

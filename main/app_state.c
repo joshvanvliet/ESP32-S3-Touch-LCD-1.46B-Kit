@@ -8,6 +8,7 @@
 
 #include "PWR_Key.h"
 #include "app_audio_capture.h"
+#include "app_audio_downlink.h"
 #include "app_ble_link.h"
 #include "app_protocol.h"
 #include "app_ui.h"
@@ -28,6 +29,7 @@ typedef enum {
     APP_EVENT_BLE_STOP_CAPTURE,
     APP_EVENT_CAPTURE_STOPPED,
     APP_EVENT_TRANSCRIPT,
+    APP_EVENT_AUDIO_DOWNLINK_DONE,
 } app_event_type_t;
 
 typedef struct {
@@ -44,6 +46,10 @@ typedef struct {
             uint8_t status;
             char text[APP_MAX_TRANSCRIPT_BYTES + 1];
         } transcript;
+        struct {
+            uint16_t session_id;
+            uint8_t status;
+        } downlink_done;
     } data;
 } app_event_t;
 
@@ -71,6 +77,7 @@ static uint8_t s_audio_profile_index;
 static uint8_t s_healthy_session_streak;
 static int64_t s_capture_wall_start_us;
 static int64_t s_uploading_state_enter_us;
+static int64_t s_last_downlink_ready_us;
 
 #define APP_LEVEL_NOTIFY_INTERVAL_US 50000
 #define APP_AUDIO_TX_QUEUE_LEN 128
@@ -80,8 +87,9 @@ static int64_t s_uploading_state_enter_us;
 #define APP_AUDIO_TX_OVERFLOW_STOP_COUNT 3
 #define APP_AUDIO_TX_DRAIN_TIMEOUT_MS 4000
 #define APP_AUDIO_PROFILE_RECOVERY_SESSIONS 3
-#define APP_TRANSCRIPT_WAIT_TIMEOUT_MS 3000
+#define APP_TRANSCRIPT_WAIT_TIMEOUT_MS 25000
 #define APP_PKT_FLAG_END 0x02
+#define APP_DOWNLINK_READY_NOTIFY_INTERVAL_US 120000
 
 typedef struct {
     uint16_t session_id;
@@ -134,6 +142,11 @@ static void app_state_set_state(app_device_state_t new_state)
     }
     app_ui_set_state(new_state);
     app_ble_link_notify_state(new_state);
+    if (new_state == APP_STATE_UPLOADING) {
+        app_ble_link_notify_agent_status(1, "Thinking...");
+    } else if (new_state == APP_STATE_RESULT) {
+        app_ble_link_notify_agent_status(0, "Idle");
+    }
 }
 
 static bool app_state_post(app_event_t ev)
@@ -369,6 +382,40 @@ static void app_state_on_ble_result_text(uint16_t session_id, uint8_t status, co
     app_state_post(ev);
 }
 
+static void app_state_on_audio_downlink_done(uint16_t session_id, uint8_t status)
+{
+    app_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = APP_EVENT_AUDIO_DOWNLINK_DONE;
+    ev.data.downlink_done.session_id = session_id;
+    ev.data.downlink_done.status = status;
+    app_state_post(ev);
+}
+
+static void app_state_on_ble_audio_downlink_packet(uint16_t session_id,
+                                                   uint16_t seq,
+                                                   uint8_t flags,
+                                                   uint8_t codec,
+                                                   const uint8_t *payload,
+                                                   uint16_t payload_len)
+{
+    bool ok = app_audio_downlink_enqueue(session_id, seq, flags, codec, payload, payload_len);
+    if (!ok) {
+        ESP_LOGW(TAG,
+                 "Downlink enqueue failed sid=%u seq=%u len=%u",
+                 session_id,
+                 seq,
+                 payload_len);
+        app_ble_link_notify_agent_status(3, "Downlink enqueue failed");
+        app_ble_link_notify_audio_downlink_done(session_id, 1);
+        return;
+    }
+    if (flags & 0x01) {
+        app_ble_link_notify_agent_status(2, "Speaking...");
+    }
+    app_ble_link_notify_audio_downlink_ready(app_audio_downlink_queue_free_slots());
+}
+
 static void app_state_on_audio_level(uint16_t level)
 {
     portENTER_CRITICAL(&s_level_lock);
@@ -505,8 +552,10 @@ static void app_state_start_capture(void)
     s_active_capture_codec = profile->codec;
     s_active_capture_sample_rate_hz = profile->sample_rate_hz;
 
+    s_capture_wall_start_us = esp_timer_get_time();
     bool ok = app_audio_capture_start(s_rt.current_session_id, profile->codec, profile->sample_rate_hz);
     if (!ok) {
+        s_capture_wall_start_us = 0;
         app_ui_set_status_text("Capture start failed");
         app_ble_link_notify_error(1);
         return;
@@ -588,6 +637,8 @@ static void app_state_handle_event(const app_event_t *ev)
             if (app_audio_capture_is_running()) {
                 app_audio_capture_request_stop(APP_STOP_REASON_MANUAL);
             }
+            s_capture_wall_start_us = 0;
+            app_audio_downlink_reset();
             app_state_clear_audio_tx_queue();
             portENTER_CRITICAL(&s_level_lock);
             s_latest_level = 0;
@@ -624,6 +675,7 @@ static void app_state_handle_event(const app_event_t *ev)
         case APP_EVENT_CAPTURE_STOPPED:
             app_capture_stop_reason_t effective_reason = ev->data.capture.reason;
             app_audio_capture_stats_t capture_stats = ev->data.capture.stats;
+            s_capture_wall_start_us = 0;
 
             bool drained = app_state_wait_for_audio_tx_drain(ev->data.capture.session_id, APP_AUDIO_TX_DRAIN_TIMEOUT_MS);
             if (!drained) {
@@ -694,6 +746,26 @@ static void app_state_handle_event(const app_event_t *ev)
             app_ui_set_status_text("Transcript mirrored from phone");
             break;
 
+        case APP_EVENT_AUDIO_DOWNLINK_DONE:
+            app_ble_link_notify_audio_downlink_done(ev->data.downlink_done.session_id, ev->data.downlink_done.status);
+            if (ev->data.downlink_done.status == 0) {
+                app_ui_set_status_text("Playback complete");
+                app_ble_link_notify_agent_status(0, "Idle");
+            } else if (ev->data.downlink_done.status == 1) {
+                app_ui_set_status_text("Playback failed (enqueue)");
+                app_ble_link_notify_agent_status(3, "Playback enqueue error");
+            } else if (ev->data.downlink_done.status == 2) {
+                app_ui_set_status_text("Playback failed (sequence)");
+                app_ble_link_notify_agent_status(3, "Playback sequence mismatch");
+            } else if (ev->data.downlink_done.status == 3) {
+                app_ui_set_status_text("Playback failed (i2s)");
+                app_ble_link_notify_agent_status(3, "Playback I2S write failed");
+            } else {
+                app_ui_set_status_text("Playback failed");
+                app_ble_link_notify_agent_status(3, "Playback error");
+            }
+            break;
+
         case APP_EVENT_NONE:
         default:
             break;
@@ -713,6 +785,7 @@ esp_err_t app_state_init(void)
     s_active_capture_codec = APP_AUDIO_CODEC_IMA_ADPCM_16K;
     s_active_capture_sample_rate_hz = APP_AUDIO_SAMPLE_RATE_16K;
     s_uploading_state_enter_us = 0;
+    s_last_downlink_ready_us = 0;
     memset(&s_audio_tx_stats, 0, sizeof(s_audio_tx_stats));
 
     s_event_queue = xQueueCreate(32, sizeof(app_event_t));
@@ -751,6 +824,7 @@ esp_err_t app_state_init(void)
         .on_control_start_capture = app_state_on_ble_start_capture,
         .on_control_stop_capture = app_state_on_ble_stop_capture,
         .on_result_text = app_state_on_ble_result_text,
+        .on_audio_downlink_packet = app_state_on_ble_audio_downlink_packet,
     };
 
     ESP_ERROR_CHECK(app_ble_link_init(&ble_callbacks));
@@ -762,6 +836,7 @@ esp_err_t app_state_init(void)
         .on_stopped = app_state_on_audio_stopped,
     };
     ESP_ERROR_CHECK(app_audio_capture_init(&audio_callbacks));
+    ESP_ERROR_CHECK(app_audio_downlink_init(app_state_on_audio_downlink_done));
 
     PWR_RegisterShortPressCallback(app_state_on_pwr_short_press);
 
@@ -803,6 +878,14 @@ void app_state_process(void)
             app_ui_set_transcript("Phone transcript timeout. Try again.", 1);
             app_ui_set_status_text("Phone transcript timeout");
             app_state_set_state(APP_STATE_RESULT);
+        }
+    }
+
+    if (app_ble_link_is_connected()) {
+        int64_t now_us = esp_timer_get_time();
+        if (s_last_downlink_ready_us == 0 || (now_us - s_last_downlink_ready_us) >= APP_DOWNLINK_READY_NOTIFY_INTERVAL_US) {
+            app_ble_link_notify_audio_downlink_ready(app_audio_downlink_queue_free_slots());
+            s_last_downlink_ready_us = now_us;
         }
     }
 }

@@ -72,13 +72,16 @@ void app_main(void)
     LCD_Init();
     LVGL_Init();
     Audio_Init();
-#if CONFIG_APP_WAKEWORD_ENABLED
-    MIC_Speech_init();
-#endif
 
     Audio_Play_Test_Tone(1000, 100);
     vTaskDelay(pdMS_TO_TICKS(60));
     Audio_Play_Test_Tone(1400, 100);
+
+#if CONFIG_APP_WAKEWORD_ENABLED
+    // Waveshare notes recommend avoiding concurrent speech recognition while speaker playback runs.
+    // Start wakeword pipeline after startup tone to keep the bring-up audio path clean.
+    MIC_Speech_init();
+#endif
 
     ESP_ERROR_CHECK(app_state_init());
 
