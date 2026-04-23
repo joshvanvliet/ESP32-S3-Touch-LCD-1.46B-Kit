@@ -4,23 +4,23 @@
 #include <string.h>
 
 #include "Audio_Driver/PCM5101.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
 #define DOWNLINK_RX_TASK_STACK 6144
-#define DOWNLINK_PLAY_TASK_STACK 4096
+#define DOWNLINK_PLAY_TASK_STACK 5120
 #define DOWNLINK_TASK_PRIO 5
 #define DOWNLINK_QUEUE_LEN 32
 #define DOWNLINK_FLAG_START 0x01
 #define DOWNLINK_FLAG_END   0x02
-#define DOWNLINK_PLAYBACK_RATE APP_AUDIO_SAMPLE_RATE_16K
 #define DOWNLINK_PLAY_FRAME_MS 20
-#define DOWNLINK_PLAY_SAMPLES ((DOWNLINK_PLAYBACK_RATE * DOWNLINK_PLAY_FRAME_MS) / 1000)
-#define DOWNLINK_PREBUFFER_MS 240
-#define DOWNLINK_PREBUFFER_SAMPLES ((DOWNLINK_PLAYBACK_RATE * DOWNLINK_PREBUFFER_MS) / 1000)
-#define DOWNLINK_RING_SAMPLES 8192
+#define DOWNLINK_MAX_PLAYBACK_RATE APP_AUDIO_SAMPLE_RATE_24K
+#define DOWNLINK_MAX_PLAY_SAMPLES ((DOWNLINK_MAX_PLAYBACK_RATE * DOWNLINK_PLAY_FRAME_MS) / 1000)
+#define DOWNLINK_PREBUFFER_MS 320
+#define DOWNLINK_RING_SAMPLES 16384
 #define DOWNLINK_RING_WRITE_WAIT_MS 350
 #define DOWNLINK_UNDERRUN_FADE_SAMPLES 24
 
@@ -29,7 +29,7 @@
 #define DOWNLINK_STATUS_SEQUENCE_FAIL 2
 #define DOWNLINK_STATUS_PLAYBACK_FAIL 3
 
-_Static_assert(DOWNLINK_PLAY_SAMPLES <= (APP_AUDIO_DOWNLINK_MAX_ADPCM_BYTES * 2), "play chunk too large");
+_Static_assert(DOWNLINK_MAX_PLAY_SAMPLES <= (APP_AUDIO_DOWNLINK_MAX_ADPCM_BYTES * 3), "play chunk too large");
 
 typedef struct {
     uint16_t session_id;
@@ -91,17 +91,18 @@ static bool s_done_sent;
 static bool s_input_finished;
 static bool s_playback_started;
 static uint8_t s_active_codec;
+static uint32_t s_active_sample_rate;
 static int16_t s_last_output_sample;
 static uint32_t s_session_packets;
 static uint32_t s_session_adpcm_bytes;
 static uint32_t s_session_pcm_samples_in;
 static uint32_t s_session_pcm_samples_out;
 static downlink_diag_t s_diag;
-static int16_t s_pcm_ring[DOWNLINK_RING_SAMPLES];
+static int16_t *s_pcm_ring;
 static uint16_t s_ring_read;
 static uint16_t s_ring_count;
 static int16_t s_decode_pcm[APP_AUDIO_DOWNLINK_MAX_ADPCM_BYTES * 2];
-static int16_t s_resample_pcm[APP_AUDIO_DOWNLINK_MAX_ADPCM_BYTES * 4];
+static int16_t s_resample_pcm[APP_AUDIO_DOWNLINK_MAX_ADPCM_BYTES * 6];
 
 static const int s_step_table[89] = {
     7, 8, 9, 10, 11, 12, 13, 14, 16, 17,
@@ -165,6 +166,9 @@ static int16_t ima_decode_nibble(ima_state_t *st, uint8_t nibble)
 
 static uint32_t codec_sample_rate(uint8_t codec)
 {
+    if (codec == APP_AUDIO_CODEC_IMA_ADPCM_24K) {
+        return APP_AUDIO_SAMPLE_RATE_24K;
+    }
     if (codec == APP_AUDIO_CODEC_IMA_ADPCM_16K) {
         return APP_AUDIO_SAMPLE_RATE_16K;
     }
@@ -179,15 +183,7 @@ static uint32_t codec_sample_rate(uint8_t codec)
 
 static uint16_t downlink_output_samples_per_full_packet(uint8_t codec)
 {
-    uint32_t source_rate = codec_sample_rate(codec);
-    uint32_t decoded_samples = APP_AUDIO_DOWNLINK_MAX_ADPCM_BYTES * 2;
-    if (source_rate == APP_AUDIO_SAMPLE_RATE_8K) {
-        return (uint16_t)(decoded_samples * 2);
-    }
-    if (source_rate == APP_AUDIO_SAMPLE_RATE_12K) {
-        return (uint16_t)(((decoded_samples * DOWNLINK_PLAYBACK_RATE) + source_rate - 1) / source_rate);
-    }
-    return (uint16_t)decoded_samples;
+    return codec_sample_rate(codec) == 0 ? 0 : (uint16_t)(APP_AUDIO_DOWNLINK_MAX_ADPCM_BYTES * 2);
 }
 
 static bool decode_adpcm_packet(const downlink_item_t *item, int16_t *out, uint16_t *out_len)
@@ -212,33 +208,47 @@ static bool decode_adpcm_packet(const downlink_item_t *item, int16_t *out, uint1
     return count == item->pcm_sample_count;
 }
 
-static uint16_t resample_to_16k(const int16_t *in, uint16_t in_len, uint32_t source_rate, int16_t *out)
+static uint16_t downlink_samples_for_ms(uint32_t sample_rate, uint32_t ms)
+{
+    if (sample_rate == 0) {
+        sample_rate = APP_AUDIO_SAMPLE_RATE_16K;
+    }
+    return (uint16_t)((sample_rate * ms) / 1000);
+}
+
+static uint32_t playback_sample_rate(void)
+{
+    uint32_t rate;
+    portENTER_CRITICAL(&s_lock);
+    rate = s_active_sample_rate;
+    portEXIT_CRITICAL(&s_lock);
+    return rate > 0 ? rate : APP_AUDIO_SAMPLE_RATE_16K;
+}
+
+static uint16_t resample_to_playback_rate(const int16_t *in,
+                                          uint16_t in_len,
+                                          uint32_t source_rate,
+                                          uint32_t target_rate,
+                                          int16_t *out)
 {
     if (in_len == 0) {
         return 0;
     }
-    if (source_rate == DOWNLINK_PLAYBACK_RATE) {
+    if (source_rate == 0 || target_rate == 0) {
+        return 0;
+    }
+    if (source_rate == target_rate) {
         memcpy(out, in, (size_t)in_len * sizeof(int16_t));
         return in_len;
     }
-    if (source_rate == APP_AUDIO_SAMPLE_RATE_8K) {
-        uint16_t count = 0;
-        for (uint16_t i = 0; i < in_len; ++i) {
-            out[count++] = in[i];
-            out[count++] = in[i];
-        }
-        return count;
-    }
-    if (source_rate != APP_AUDIO_SAMPLE_RATE_12K) {
-        return 0;
-    }
 
-    uint32_t out_count = ((uint32_t)in_len * DOWNLINK_PLAYBACK_RATE) / source_rate;
-    if (out_count > (APP_AUDIO_DOWNLINK_MAX_ADPCM_BYTES * 4)) {
-        out_count = APP_AUDIO_DOWNLINK_MAX_ADPCM_BYTES * 4;
+    uint32_t out_capacity = APP_AUDIO_DOWNLINK_MAX_ADPCM_BYTES * 6;
+    uint32_t out_count = ((uint32_t)in_len * target_rate) / source_rate;
+    if (out_count > out_capacity) {
+        out_count = out_capacity;
     }
     for (uint32_t i = 0; i < out_count; ++i) {
-        uint64_t src_q16_wide = (((uint64_t)i * (uint64_t)source_rate) << 16) / DOWNLINK_PLAYBACK_RATE;
+        uint64_t src_q16_wide = (((uint64_t)i * (uint64_t)source_rate) << 16) / target_rate;
         uint32_t src_index = (uint32_t)(src_q16_wide >> 16);
         uint32_t frac = (uint32_t)(src_q16_wide & 0xFFFF);
         if (src_index >= in_len) {
@@ -261,6 +271,9 @@ static void ring_clear_locked(void)
 
 static uint16_t ring_free_locked(void)
 {
+    if (!s_pcm_ring) {
+        return 0;
+    }
     return (uint16_t)(DOWNLINK_RING_SAMPLES - s_ring_count);
 }
 
@@ -296,6 +309,10 @@ static bool playback_active(uint16_t *session_id)
 
 static uint16_t ring_write_some(const int16_t *samples, uint16_t count)
 {
+    if (!s_pcm_ring) {
+        return 0;
+    }
+
     uint16_t written = 0;
     portENTER_CRITICAL(&s_lock);
     uint16_t free_count = ring_free_locked();
@@ -341,6 +358,10 @@ static bool ring_write_all(uint16_t session_id, const int16_t *samples, uint16_t
 
 static uint16_t ring_read_some(int16_t *out, uint16_t max_count)
 {
+    if (!s_pcm_ring) {
+        return 0;
+    }
+
     uint16_t count = 0;
     portENTER_CRITICAL(&s_lock);
     if (max_count > s_ring_count) {
@@ -423,6 +444,11 @@ static void downlink_emit_done(uint16_t session_id, uint8_t status)
 
 static void downlink_begin_session(const downlink_item_t *item)
 {
+    uint32_t sample_rate = codec_sample_rate(item->codec);
+    if (sample_rate == 0) {
+        sample_rate = APP_AUDIO_SAMPLE_RATE_16K;
+    }
+
     portENTER_CRITICAL(&s_lock);
     s_state = DOWNLINK_STATE_ACTIVE;
     s_active_session = item->session_id;
@@ -432,6 +458,7 @@ static void downlink_begin_session(const downlink_item_t *item)
     s_input_finished = false;
     s_playback_started = false;
     s_active_codec = item->codec;
+    s_active_sample_rate = sample_rate;
     s_last_output_sample = 0;
     s_session_packets = 0;
     s_session_adpcm_bytes = 0;
@@ -612,7 +639,13 @@ static void downlink_rx_task(void *arg)
             continue;
         }
 
-        uint16_t output_count = resample_to_16k(s_decode_pcm, decoded_count, source_rate, s_resample_pcm);
+        uint32_t target_rate = playback_sample_rate();
+        uint16_t output_count = resample_to_playback_rate(
+            s_decode_pcm,
+            decoded_count,
+            source_rate,
+            target_rate,
+            s_resample_pcm);
         if (output_count == 0) {
             portENTER_CRITICAL(&s_lock);
             s_diag.invalid_packets++;
@@ -641,7 +674,7 @@ static void downlink_rx_task(void *arg)
 static void downlink_playback_task(void *arg)
 {
     (void)arg;
-    int16_t chunk[DOWNLINK_PLAY_SAMPLES];
+    int16_t chunk[DOWNLINK_MAX_PLAY_SAMPLES];
     TickType_t last_wake = xTaskGetTickCount();
     bool cadence_active = false;
 
@@ -653,14 +686,27 @@ static void downlink_playback_task(void *arg)
             continue;
         }
 
+        uint32_t sample_rate = playback_sample_rate();
+        uint16_t play_samples = downlink_samples_for_ms(sample_rate, DOWNLINK_PLAY_FRAME_MS);
+        if (play_samples == 0 || play_samples > DOWNLINK_MAX_PLAY_SAMPLES) {
+            sample_rate = APP_AUDIO_SAMPLE_RATE_16K;
+            play_samples = downlink_samples_for_ms(sample_rate, DOWNLINK_PLAY_FRAME_MS);
+        }
+
         if (!playback_started()) {
             uint16_t buffered = ring_count();
             bool finished = input_finished();
-            if (buffered >= DOWNLINK_PREBUFFER_SAMPLES || (finished && buffered > 0)) {
+            uint16_t prebuffer_samples = downlink_samples_for_ms(sample_rate, DOWNLINK_PREBUFFER_MS);
+            if (buffered >= prebuffer_samples || (finished && buffered > 0)) {
                 mark_playback_started();
                 last_wake = xTaskGetTickCount();
                 cadence_active = true;
-                ESP_LOGI(TAG, "Downlink playback start sid=%u buffered=%u", session_id, buffered);
+                ESP_LOGI(TAG,
+                         "Downlink playback start sid=%u rate=%lu buffered=%u prebuffer=%u",
+                         session_id,
+                         (unsigned long)sample_rate,
+                         buffered,
+                         prebuffer_samples);
             } else if (finished && buffered == 0) {
                 cadence_active = false;
                 downlink_emit_done(session_id, DOWNLINK_STATUS_OK);
@@ -676,26 +722,26 @@ static void downlink_playback_task(void *arg)
         }
 
         bool finished_before_read = input_finished();
-        uint16_t got = ring_read_some(chunk, DOWNLINK_PLAY_SAMPLES);
+        uint16_t got = ring_read_some(chunk, play_samples);
         if (got == 0) {
             if (finished_before_read) {
                 downlink_emit_done(session_id, DOWNLINK_STATUS_OK);
                 continue;
             }
             note_underrun(session_id, got, finished_before_read);
-            fill_underrun_tail(chunk, 0, DOWNLINK_PLAY_SAMPLES);
-            got = DOWNLINK_PLAY_SAMPLES;
-        } else if (got < DOWNLINK_PLAY_SAMPLES && !finished_before_read) {
+            fill_underrun_tail(chunk, 0, play_samples);
+            got = play_samples;
+        } else if (got < play_samples && !finished_before_read) {
             note_underrun(session_id, got, finished_before_read);
             s_last_output_sample = chunk[got - 1];
-            fill_underrun_tail(chunk, got, DOWNLINK_PLAY_SAMPLES);
-            got = DOWNLINK_PLAY_SAMPLES;
+            fill_underrun_tail(chunk, got, play_samples);
+            got = play_samples;
         } else if (got > 0) {
             s_last_output_sample = chunk[got - 1];
         }
 
         if (got > 0) {
-            bool play_ok = Audio_Play_PCM16_Mono(chunk, got, DOWNLINK_PLAYBACK_RATE);
+            bool play_ok = Audio_Play_PCM16_Mono(chunk, got, sample_rate);
             if (!play_ok) {
                 portENTER_CRITICAL(&s_lock);
                 s_diag.i2s_fails++;
@@ -718,6 +764,22 @@ static void downlink_playback_task(void *arg)
 esp_err_t app_audio_downlink_init(app_audio_downlink_done_cb_t done_cb)
 {
     s_done_cb = done_cb;
+
+    if (!s_pcm_ring) {
+        s_pcm_ring = heap_caps_calloc(DOWNLINK_RING_SAMPLES, sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_pcm_ring) {
+            ESP_LOGE(TAG,
+                     "Failed to allocate downlink PCM ring in PSRAM samples=%u bytes=%u",
+                     DOWNLINK_RING_SAMPLES,
+                     (unsigned)(DOWNLINK_RING_SAMPLES * sizeof(int16_t)));
+            return ESP_ERR_NO_MEM;
+        }
+        ESP_LOGI(TAG,
+                 "Downlink PCM ring allocated in PSRAM samples=%u bytes=%u",
+                 DOWNLINK_RING_SAMPLES,
+                 (unsigned)(DOWNLINK_RING_SAMPLES * sizeof(int16_t)));
+    }
+
     if (!s_queue) {
         s_queue = xQueueCreate(DOWNLINK_QUEUE_LEN, sizeof(downlink_item_t));
         if (!s_queue) {
@@ -807,6 +869,7 @@ void app_audio_downlink_reset(void)
     s_input_finished = false;
     s_playback_started = false;
     s_active_codec = APP_AUDIO_CODEC_IMA_ADPCM_16K;
+    s_active_sample_rate = APP_AUDIO_SAMPLE_RATE_16K;
     s_last_output_sample = 0;
     s_session_packets = 0;
     s_session_adpcm_bytes = 0;

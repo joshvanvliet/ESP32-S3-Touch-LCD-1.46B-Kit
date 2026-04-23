@@ -59,6 +59,9 @@ static void driver_init(void)
 
 void app_main(void)
 {
+    esp_log_level_set("lcd_panel.io.spi", ESP_LOG_NONE);
+    esp_log_level_set("spd2010", ESP_LOG_NONE);
+
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
