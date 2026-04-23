@@ -71,15 +71,16 @@ static uint16_t s_latest_level;
 static bool s_latest_level_pending;
 static int64_t s_last_level_ui_us;
 static int64_t s_last_level_notify_us;
+static int64_t s_last_downlink_ready_us;
 static uint8_t s_active_capture_codec = APP_AUDIO_CODEC_IMA_ADPCM_16K;
 static uint32_t s_active_capture_sample_rate_hz = APP_AUDIO_SAMPLE_RATE_16K;
 static uint8_t s_audio_profile_index;
 static uint8_t s_healthy_session_streak;
 static int64_t s_capture_wall_start_us;
 static int64_t s_uploading_state_enter_us;
-static int64_t s_last_downlink_ready_us;
 
 #define APP_LEVEL_NOTIFY_INTERVAL_US 50000
+#define APP_DOWNLINK_READY_NOTIFY_INTERVAL_US 40000
 #define APP_AUDIO_TX_QUEUE_LEN 128
 #define APP_AUDIO_TX_TASK_STACK_SIZE 4096
 #define APP_AUDIO_TX_TASK_PRIORITY 5
@@ -89,7 +90,6 @@ static int64_t s_last_downlink_ready_us;
 #define APP_AUDIO_PROFILE_RECOVERY_SESSIONS 3
 #define APP_TRANSCRIPT_WAIT_TIMEOUT_MS 25000
 #define APP_PKT_FLAG_END 0x02
-#define APP_DOWNLINK_READY_NOTIFY_INTERVAL_US 120000
 
 typedef struct {
     uint16_t session_id;
@@ -396,16 +396,29 @@ static void app_state_on_ble_audio_downlink_packet(uint16_t session_id,
                                                    uint16_t seq,
                                                    uint8_t flags,
                                                    uint8_t codec,
+                                                   uint16_t pcm_sample_count,
+                                                   int16_t predictor,
+                                                   uint8_t step_index,
                                                    const uint8_t *payload,
                                                    uint16_t payload_len)
 {
-    bool ok = app_audio_downlink_enqueue(session_id, seq, flags, codec, payload, payload_len);
+    bool ok = app_audio_downlink_enqueue(
+        session_id,
+        seq,
+        flags,
+        codec,
+        pcm_sample_count,
+        predictor,
+        step_index,
+        payload,
+        payload_len);
     if (!ok) {
         ESP_LOGW(TAG,
                  "Downlink enqueue failed sid=%u seq=%u len=%u",
                  session_id,
                  seq,
                  payload_len);
+        app_audio_downlink_reset();
         app_ble_link_notify_agent_status(3, "Downlink enqueue failed");
         app_ble_link_notify_audio_downlink_done(session_id, 1);
         return;
@@ -413,7 +426,7 @@ static void app_state_on_ble_audio_downlink_packet(uint16_t session_id,
     if (flags & 0x01) {
         app_ble_link_notify_agent_status(2, "Speaking...");
     }
-    app_ble_link_notify_audio_downlink_ready(app_audio_downlink_queue_free_slots());
+    app_ble_link_notify_audio_downlink_ready(app_audio_downlink_available_credits());
 }
 
 static void app_state_on_audio_level(uint16_t level)
@@ -572,6 +585,7 @@ static void app_state_start_capture(void)
     app_ui_set_recording_level(0);
     s_last_level_ui_us = 0;
     s_last_level_notify_us = 0;
+    s_last_downlink_ready_us = 0;
     portENTER_CRITICAL(&s_level_lock);
     s_latest_level = 0;
     s_latest_level_pending = false;
@@ -617,6 +631,7 @@ static void app_state_handle_event(const app_event_t *ev)
             app_state_set_state(APP_STATE_READY);
             app_ui_set_pairing_passkey(0, false);
             app_ui_set_status_text("Phone app connected");
+            app_ble_link_notify_audio_downlink_ready(app_audio_downlink_available_credits());
             break;
 
         case APP_EVENT_BLE_PAIRING_FAILED:
@@ -785,7 +800,6 @@ esp_err_t app_state_init(void)
     s_active_capture_codec = APP_AUDIO_CODEC_IMA_ADPCM_16K;
     s_active_capture_sample_rate_hz = APP_AUDIO_SAMPLE_RATE_16K;
     s_uploading_state_enter_us = 0;
-    s_last_downlink_ready_us = 0;
     memset(&s_audio_tx_stats, 0, sizeof(s_audio_tx_stats));
 
     s_event_queue = xQueueCreate(32, sizeof(app_event_t));
@@ -881,11 +895,15 @@ void app_state_process(void)
         }
     }
 
-    if (app_ble_link_is_connected()) {
+    if (app_ble_link_is_connected() && app_audio_downlink_active()) {
         int64_t now_us = esp_timer_get_time();
-        if (s_last_downlink_ready_us == 0 || (now_us - s_last_downlink_ready_us) >= APP_DOWNLINK_READY_NOTIFY_INTERVAL_US) {
-            app_ble_link_notify_audio_downlink_ready(app_audio_downlink_queue_free_slots());
+        if (s_last_downlink_ready_us == 0 ||
+            (now_us - s_last_downlink_ready_us) >= APP_DOWNLINK_READY_NOTIFY_INTERVAL_US) {
+            app_ble_link_notify_audio_downlink_ready(app_audio_downlink_available_credits());
             s_last_downlink_ready_us = now_us;
         }
+    } else {
+        s_last_downlink_ready_us = 0;
     }
+
 }

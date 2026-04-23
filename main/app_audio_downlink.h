@@ -13,7 +13,12 @@ bool app_audio_downlink_enqueue(uint16_t session_id,
                                 uint16_t seq,
                                 uint8_t flags,
                                 uint8_t codec,
+                                uint16_t pcm_sample_count,
+                                int16_t predictor,
+                                uint8_t step_index,
                                 const uint8_t *payload,
                                 uint16_t payload_len);
 void app_audio_downlink_reset(void);
+bool app_audio_downlink_active(void);
 uint8_t app_audio_downlink_queue_free_slots(void);
+uint8_t app_audio_downlink_available_credits(void);

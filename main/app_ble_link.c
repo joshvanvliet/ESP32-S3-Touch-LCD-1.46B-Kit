@@ -25,7 +25,7 @@
 extern void ble_store_config_init(void);
 
 #define APP_BLE_DEVICE_NAME "ESP Assistant"
-#define APP_BLE_PACKET_MAX 192
+#define APP_BLE_PACKET_MAX 244
 #define APP_BLE_DEFAULT_NOTIFY_PAYLOAD_MAX 185
 
 #ifndef BLE_ATT_ERR_INSUFFICIENT_AUTHEN
@@ -371,6 +371,9 @@ static int app_ble_access_cb(
                                                  header.seq,
                                                  header.flags,
                                                  header.codec,
+                                                 header.pcm_sample_count,
+                                                 header.predictor,
+                                                 header.step_index,
                                                  &buf[sizeof(header)],
                                                  header.payload_len);
         }
@@ -703,6 +706,8 @@ static void app_ble_host_task(void *param)
 
 esp_err_t app_ble_link_init(const app_ble_callbacks_t *callbacks)
 {
+    esp_log_level_set("NimBLE", ESP_LOG_WARN);
+
     if (s_initialized) {
         return ESP_OK;
     }

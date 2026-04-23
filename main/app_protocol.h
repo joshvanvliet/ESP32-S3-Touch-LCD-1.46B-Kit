@@ -10,7 +10,7 @@
 #define APP_GATT_RESULT_UUID  "7f5a0005-5d7f-4f51-9ed4-30f4b6d90000"
 #define APP_GATT_AUDIO_DOWNLINK_UUID "7f5a0006-5d7f-4f51-9ed4-30f4b6d90000"
 
-#define APP_PROTOCOL_VERSION 0x03
+#define APP_PROTOCOL_VERSION 0x04
 
 #define APP_AUDIO_CODEC_IMA_ADPCM_16K 0x01
 #define APP_AUDIO_CODEC_IMA_ADPCM_12K 0x02
@@ -85,6 +85,10 @@ typedef struct __attribute__((packed)) {
     uint8_t flags;
     uint8_t codec;
     uint16_t payload_len;
+    uint16_t pcm_sample_count;
+    int16_t predictor;
+    uint8_t step_index;
+    uint8_t reserved;
 } app_audio_downlink_packet_header_t;
 
 typedef struct __attribute__((packed)) {
