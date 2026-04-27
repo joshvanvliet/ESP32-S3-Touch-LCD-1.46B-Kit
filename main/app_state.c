@@ -397,8 +397,8 @@ static void app_state_on_ble_audio_downlink_packet(uint16_t session_id,
                                                    uint8_t flags,
                                                    uint8_t codec,
                                                    uint16_t pcm_sample_count,
-                                                   int16_t predictor,
-                                                   uint8_t step_index,
+                                                   uint16_t codec_param0,
+                                                   uint8_t codec_param1,
                                                    const uint8_t *payload,
                                                    uint16_t payload_len)
 {
@@ -408,8 +408,8 @@ static void app_state_on_ble_audio_downlink_packet(uint16_t session_id,
         flags,
         codec,
         pcm_sample_count,
-        predictor,
-        step_index,
+        codec_param0,
+        codec_param1,
         payload,
         payload_len);
     if (!ok) {

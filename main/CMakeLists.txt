@@ -42,5 +42,6 @@ idf_component_register(
         "bt"
         "spi_flash"
     PRIV_REQUIRES
+        "esp_audio_codec"
         "nvs_flash"
 )

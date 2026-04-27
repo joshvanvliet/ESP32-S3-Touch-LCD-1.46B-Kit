@@ -359,7 +359,7 @@ static int app_ble_access_cb(
 
         app_audio_downlink_packet_header_t header;
         memcpy(&header, buf, sizeof(header));
-        if (header.payload_len > APP_AUDIO_DOWNLINK_MAX_ADPCM_BYTES) {
+        if (header.payload_len > APP_AUDIO_DOWNLINK_MAX_PAYLOAD_BYTES) {
             return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
         }
         if ((uint16_t)(sizeof(header) + header.payload_len) > len) {
@@ -372,8 +372,8 @@ static int app_ble_access_cb(
                                                  header.flags,
                                                  header.codec,
                                                  header.pcm_sample_count,
-                                                 header.predictor,
-                                                 header.step_index,
+                                                 header.codec_param0,
+                                                 header.codec_param1,
                                                  &buf[sizeof(header)],
                                                  header.payload_len);
         }

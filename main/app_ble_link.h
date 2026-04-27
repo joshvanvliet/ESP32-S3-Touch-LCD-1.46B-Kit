@@ -21,8 +21,8 @@ typedef struct {
                                      uint8_t flags,
                                      uint8_t codec,
                                      uint16_t pcm_sample_count,
-                                     int16_t predictor,
-                                     uint8_t step_index,
+                                     uint16_t codec_param0,
+                                     uint8_t codec_param1,
                                      const uint8_t *payload,
                                      uint16_t payload_len);
 } app_ble_callbacks_t;

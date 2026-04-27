@@ -4,32 +4,54 @@
 #include <string.h>
 
 #include "Audio_Driver/PCM5101.h"
+#include "esp_audio_dec.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_opus_dec.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
-#define DOWNLINK_RX_TASK_STACK 6144
+#define DOWNLINK_RX_TASK_STACK 20480
+#define DOWNLINK_RX_TASK_STACK_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 #define DOWNLINK_PLAY_TASK_STACK 5120
 #define DOWNLINK_TASK_PRIO 5
 #define DOWNLINK_QUEUE_LEN 32
 #define DOWNLINK_FLAG_START 0x01
 #define DOWNLINK_FLAG_END   0x02
+#define DOWNLINK_FLAG_FRAME_START 0x04
+#define DOWNLINK_FLAG_FRAME_END   0x08
 #define DOWNLINK_PLAY_FRAME_MS 20
 #define DOWNLINK_MAX_PLAYBACK_RATE APP_AUDIO_SAMPLE_RATE_24K
 #define DOWNLINK_MAX_PLAY_SAMPLES ((DOWNLINK_MAX_PLAYBACK_RATE * DOWNLINK_PLAY_FRAME_MS) / 1000)
+#define DOWNLINK_OPUS_FRAME_MS 20
+#define DOWNLINK_OPUS_FRAME_SAMPLES ((APP_AUDIO_SAMPLE_RATE_24K * DOWNLINK_OPUS_FRAME_MS) / 1000)
+#define DOWNLINK_OPUS_MAX_FRAME_BYTES 1275
 #define DOWNLINK_PREBUFFER_MS 320
 #define DOWNLINK_RING_SAMPLES 16384
 #define DOWNLINK_RING_WRITE_WAIT_MS 350
 #define DOWNLINK_UNDERRUN_FADE_SAMPLES 24
+#define DOWNLINK_ADPCM_PLAYBACK_GAIN_NUM 1
+#define DOWNLINK_ADPCM_PLAYBACK_GAIN_DEN 10
+#define DOWNLINK_OPUS_PLAYBACK_GAIN_NUM 1
+#define DOWNLINK_OPUS_PLAYBACK_GAIN_DEN 2
+#define DOWNLINK_POSTFILTER_PREV_NUM 1
+#define DOWNLINK_POSTFILTER_CUR_NUM 1
+#define DOWNLINK_POSTFILTER_DEN 2
+#define DOWNLINK_CLIP_SAMPLE_THRESHOLD 32760U
 
 #define DOWNLINK_STATUS_OK 0
 #define DOWNLINK_STATUS_ENQUEUE_FAIL 1
 #define DOWNLINK_STATUS_SEQUENCE_FAIL 2
 #define DOWNLINK_STATUS_PLAYBACK_FAIL 3
 
-_Static_assert(DOWNLINK_MAX_PLAY_SAMPLES <= (APP_AUDIO_DOWNLINK_MAX_ADPCM_BYTES * 3), "play chunk too large");
+_Static_assert(sizeof(app_audio_downlink_packet_header_t) == 14, "downlink header must stay 14 bytes");
+_Static_assert(DOWNLINK_MAX_PLAY_SAMPLES <= (APP_AUDIO_DOWNLINK_MAX_PAYLOAD_BYTES * 3), "play chunk too large");
+_Static_assert(DOWNLINK_OPUS_FRAME_SAMPLES == 480, "opus frame must stay 20ms at 24k");
+_Static_assert(DOWNLINK_ADPCM_PLAYBACK_GAIN_DEN > 0, "adpcm playback gain denominator must be positive");
+_Static_assert(DOWNLINK_OPUS_PLAYBACK_GAIN_DEN > 0, "opus playback gain denominator must be positive");
+_Static_assert(DOWNLINK_POSTFILTER_DEN > 0, "postfilter denominator must be positive");
 
 typedef struct {
     uint16_t session_id;
@@ -37,10 +59,10 @@ typedef struct {
     uint8_t flags;
     uint8_t codec;
     uint16_t pcm_sample_count;
-    int16_t predictor;
-    uint8_t step_index;
+    uint16_t codec_param0;
+    uint8_t codec_param1;
     uint16_t payload_len;
-    uint8_t payload[APP_AUDIO_DOWNLINK_MAX_ADPCM_BYTES];
+    uint8_t payload[APP_AUDIO_DOWNLINK_MAX_PAYLOAD_BYTES];
 } downlink_item_t;
 
 typedef struct {
@@ -66,11 +88,20 @@ typedef struct {
     uint32_t underruns;
     uint32_t i2s_fails;
     uint32_t queue_high_watermark;
+    uint32_t source_clip_samples;
+    uint32_t playback_clip_samples;
+    uint32_t opus_frames;
+    uint32_t opus_fragments;
+    uint32_t opus_decode_fail;
+    uint32_t opus_oversize;
+    uint32_t opus_malformed_fragments;
+    uint16_t source_peak;
+    uint16_t playback_peak;
 } downlink_diag_t;
 
 typedef struct {
     uint32_t packets;
-    uint32_t adpcm_bytes;
+    uint32_t encoded_bytes;
     uint32_t pcm_samples_in;
     uint32_t pcm_samples_out;
     downlink_diag_t diag;
@@ -93,16 +124,25 @@ static bool s_playback_started;
 static uint8_t s_active_codec;
 static uint32_t s_active_sample_rate;
 static int16_t s_last_output_sample;
+static int16_t s_postfilter_prev_sample;
+static bool s_postfilter_has_prev;
 static uint32_t s_session_packets;
-static uint32_t s_session_adpcm_bytes;
+static uint32_t s_session_encoded_bytes;
 static uint32_t s_session_pcm_samples_in;
 static uint32_t s_session_pcm_samples_out;
 static downlink_diag_t s_diag;
 static int16_t *s_pcm_ring;
 static uint16_t s_ring_read;
 static uint16_t s_ring_count;
-static int16_t s_decode_pcm[APP_AUDIO_DOWNLINK_MAX_ADPCM_BYTES * 2];
-static int16_t s_resample_pcm[APP_AUDIO_DOWNLINK_MAX_ADPCM_BYTES * 6];
+static int16_t s_decode_pcm[APP_AUDIO_DOWNLINK_MAX_PAYLOAD_BYTES * 2];
+static int16_t s_resample_pcm[APP_AUDIO_DOWNLINK_MAX_PAYLOAD_BYTES * 6];
+static esp_audio_dec_handle_t s_opus_decoder;
+static bool s_opus_registered;
+static uint8_t s_opus_frame[DOWNLINK_OPUS_MAX_FRAME_BYTES];
+static uint16_t s_opus_frame_len;
+static uint16_t s_opus_frame_pcm_samples;
+static bool s_opus_frame_active;
+static int16_t s_opus_pcm[DOWNLINK_OPUS_FRAME_SAMPLES];
 
 static const int s_step_table[89] = {
     7, 8, 9, 10, 11, 12, 13, 14, 16, 17,
@@ -166,6 +206,9 @@ static int16_t ima_decode_nibble(ima_state_t *st, uint8_t nibble)
 
 static uint32_t codec_sample_rate(uint8_t codec)
 {
+    if (codec == APP_AUDIO_CODEC_OPUS_24K) {
+        return APP_AUDIO_SAMPLE_RATE_24K;
+    }
     if (codec == APP_AUDIO_CODEC_IMA_ADPCM_24K) {
         return APP_AUDIO_SAMPLE_RATE_24K;
     }
@@ -181,20 +224,37 @@ static uint32_t codec_sample_rate(uint8_t codec)
     return 0;
 }
 
+static bool is_opus_codec(uint8_t codec)
+{
+    return codec == APP_AUDIO_CODEC_OPUS_24K;
+}
+
+static bool is_adpcm_codec(uint8_t codec)
+{
+    return codec == APP_AUDIO_CODEC_IMA_ADPCM_24K ||
+           codec == APP_AUDIO_CODEC_IMA_ADPCM_16K ||
+           codec == APP_AUDIO_CODEC_IMA_ADPCM_12K ||
+           codec == APP_AUDIO_CODEC_IMA_ADPCM_8K;
+}
+
 static uint16_t downlink_output_samples_per_full_packet(uint8_t codec)
 {
-    return codec_sample_rate(codec) == 0 ? 0 : (uint16_t)(APP_AUDIO_DOWNLINK_MAX_ADPCM_BYTES * 2);
+    if (is_opus_codec(codec)) {
+        return DOWNLINK_OPUS_FRAME_SAMPLES;
+    }
+    return is_adpcm_codec(codec) ? (uint16_t)(APP_AUDIO_DOWNLINK_MAX_PAYLOAD_BYTES * 2) : 0;
 }
 
 static bool decode_adpcm_packet(const downlink_item_t *item, int16_t *out, uint16_t *out_len)
 {
-    if (item->step_index > 88 || item->pcm_sample_count > (uint16_t)(item->payload_len * 2)) {
+    uint8_t step_index = item->codec_param1;
+    if (step_index > 88 || item->pcm_sample_count > (uint16_t)(item->payload_len * 2)) {
         return false;
     }
 
     ima_state_t st = {
-        .predictor = item->predictor,
-        .index = item->step_index,
+        .predictor = (int16_t)item->codec_param0,
+        .index = step_index,
     };
     uint16_t count = 0;
     for (uint16_t i = 0; i < item->payload_len && count < item->pcm_sample_count; ++i) {
@@ -206,6 +266,102 @@ static bool decode_adpcm_packet(const downlink_item_t *item, int16_t *out, uint1
     }
     *out_len = count;
     return count == item->pcm_sample_count;
+}
+
+static void reset_opus_fragment_state(void)
+{
+    s_opus_frame_len = 0;
+    s_opus_frame_pcm_samples = 0;
+    s_opus_frame_active = false;
+}
+
+static bool ensure_opus_decoder(void)
+{
+    if (s_opus_decoder) {
+        return true;
+    }
+
+    if (!s_opus_registered) {
+        esp_audio_err_t reg = esp_opus_dec_register();
+        if (reg != ESP_AUDIO_ERR_OK && reg != ESP_AUDIO_ERR_ALREADY_EXIST) {
+            ESP_LOGE(TAG, "Opus decoder register failed ret=%d", (int)reg);
+            return false;
+        }
+        s_opus_registered = true;
+    }
+
+    esp_opus_dec_cfg_t opus_cfg = ESP_OPUS_DEC_CONFIG_DEFAULT();
+    opus_cfg.sample_rate = APP_AUDIO_SAMPLE_RATE_24K;
+    opus_cfg.channel = ESP_AUDIO_MONO;
+    opus_cfg.frame_duration = ESP_OPUS_DEC_FRAME_DURATION_20_MS;
+    opus_cfg.self_delimited = false;
+
+    esp_audio_dec_cfg_t dec_cfg = {
+        .type = ESP_AUDIO_TYPE_OPUS,
+        .cfg = &opus_cfg,
+        .cfg_sz = sizeof(opus_cfg),
+    };
+    esp_audio_err_t ret = esp_audio_dec_open(&dec_cfg, &s_opus_decoder);
+    if (ret != ESP_AUDIO_ERR_OK) {
+        ESP_LOGE(TAG, "Opus decoder open failed ret=%d", (int)ret);
+        s_opus_decoder = NULL;
+        return false;
+    }
+    ESP_LOGI(TAG,
+             "Opus decoder opened sr=%u frame_ms=%u rx_stack_hw=%lu",
+             APP_AUDIO_SAMPLE_RATE_24K,
+             DOWNLINK_OPUS_FRAME_MS,
+             (unsigned long)uxTaskGetStackHighWaterMark(NULL));
+    return true;
+}
+
+static bool decode_opus_frame(int16_t *out, uint16_t *out_len)
+{
+    *out_len = 0;
+    if (!s_opus_frame_active || s_opus_frame_len == 0 || !ensure_opus_decoder()) {
+        return false;
+    }
+
+    esp_audio_dec_in_raw_t raw = {
+        .buffer = s_opus_frame,
+        .len = s_opus_frame_len,
+        .consumed = 0,
+    };
+    esp_audio_dec_out_frame_t frame = {
+        .buffer = (uint8_t *)out,
+        .len = DOWNLINK_OPUS_FRAME_SAMPLES * sizeof(int16_t),
+        .needed_size = 0,
+        .decoded_size = 0,
+    };
+
+    esp_audio_err_t ret = esp_audio_dec_process(s_opus_decoder, &raw, &frame);
+    if (ret != ESP_AUDIO_ERR_OK ||
+        raw.consumed != s_opus_frame_len ||
+        frame.decoded_size != (uint32_t)(s_opus_frame_pcm_samples * sizeof(int16_t))) {
+        ESP_LOGW(TAG,
+                 "Opus decode failed ret=%d consumed=%lu/%u decoded=%lu expected=%u",
+                 (int)ret,
+                 (unsigned long)raw.consumed,
+                 s_opus_frame_len,
+                 (unsigned long)frame.decoded_size,
+                 (unsigned)(s_opus_frame_pcm_samples * sizeof(int16_t)));
+        return false;
+    }
+
+    esp_audio_dec_info_t info;
+    if (esp_audio_dec_get_info(s_opus_decoder, &info) == ESP_AUDIO_ERR_OK) {
+        if (info.sample_rate != APP_AUDIO_SAMPLE_RATE_24K || info.channel != ESP_AUDIO_MONO || info.bits_per_sample != 16) {
+            ESP_LOGW(TAG,
+                     "Opus decode info mismatch sr=%lu ch=%u bits=%u",
+                     (unsigned long)info.sample_rate,
+                     info.channel,
+                     info.bits_per_sample);
+            return false;
+        }
+    }
+
+    *out_len = (uint16_t)(frame.decoded_size / sizeof(int16_t));
+    return *out_len == s_opus_frame_pcm_samples;
 }
 
 static uint16_t downlink_samples_for_ms(uint32_t sample_rate, uint32_t ms)
@@ -242,7 +398,7 @@ static uint16_t resample_to_playback_rate(const int16_t *in,
         return in_len;
     }
 
-    uint32_t out_capacity = APP_AUDIO_DOWNLINK_MAX_ADPCM_BYTES * 6;
+    uint32_t out_capacity = APP_AUDIO_DOWNLINK_MAX_PAYLOAD_BYTES * 6;
     uint32_t out_count = ((uint32_t)in_len * target_rate) / source_rate;
     if (out_count > out_capacity) {
         out_count = out_capacity;
@@ -267,6 +423,12 @@ static void ring_clear_locked(void)
 {
     s_ring_read = 0;
     s_ring_count = 0;
+}
+
+static void reset_playback_postfilter_locked(void)
+{
+    s_postfilter_prev_sample = 0;
+    s_postfilter_has_prev = false;
 }
 
 static uint16_t ring_free_locked(void)
@@ -381,11 +543,24 @@ static void downlink_snapshot_summary(downlink_summary_t *summary)
     memset(summary, 0, sizeof(*summary));
     portENTER_CRITICAL(&s_lock);
     summary->packets = s_session_packets;
-    summary->adpcm_bytes = s_session_adpcm_bytes;
+    summary->encoded_bytes = s_session_encoded_bytes;
     summary->pcm_samples_in = s_session_pcm_samples_in;
     summary->pcm_samples_out = s_session_pcm_samples_out;
     summary->diag = s_diag;
     portEXIT_CRITICAL(&s_lock);
+}
+
+static void log_task_create_failed(const char *name, uint32_t stack_bytes, UBaseType_t caps)
+{
+    ESP_LOGE(TAG,
+             "Failed to create task %s stack=%lu caps=0x%lx internal_free=%lu internal_largest=%lu psram_free=%lu psram_largest=%lu",
+             name,
+             (unsigned long)stack_bytes,
+             (unsigned long)caps,
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+             (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
 }
 
 static void downlink_emit_done(uint16_t session_id, uint8_t status)
@@ -421,13 +596,22 @@ static void downlink_emit_done(uint16_t session_id, uint8_t status)
     downlink_summary_t summary;
     downlink_snapshot_summary(&summary);
     ESP_LOGI(TAG,
-             "Downlink summary sid=%u status=%u packets=%lu adpcm_bytes=%lu pcm_in=%lu pcm_out=%lu dup=%lu stale=%lu retry=%lu gaps=%lu invalid=%lu unsupported=%lu ring_timeout=%lu ring_overflow=%lu underruns=%lu i2s=%lu q_high=%lu stack_hw=%lu",
+             "Downlink summary sid=%u status=%u packets=%lu encoded_bytes=%lu pcm_in=%lu pcm_out=%lu src_peak=%u src_clip=%lu play_peak=%u play_clip=%lu opus_frames=%lu opus_fragments=%lu opus_decode_fail=%lu opus_oversize=%lu opus_malformed=%lu dup=%lu stale=%lu retry=%lu gaps=%lu invalid=%lu unsupported=%lu ring_timeout=%lu ring_overflow=%lu underruns=%lu i2s=%lu q_high=%lu stack_hw=%lu",
              session_id,
              status,
              (unsigned long)summary.packets,
-             (unsigned long)summary.adpcm_bytes,
+             (unsigned long)summary.encoded_bytes,
              (unsigned long)summary.pcm_samples_in,
              (unsigned long)summary.pcm_samples_out,
+             (unsigned int)summary.diag.source_peak,
+             (unsigned long)summary.diag.source_clip_samples,
+             (unsigned int)summary.diag.playback_peak,
+             (unsigned long)summary.diag.playback_clip_samples,
+             (unsigned long)summary.diag.opus_frames,
+             (unsigned long)summary.diag.opus_fragments,
+             (unsigned long)summary.diag.opus_decode_fail,
+             (unsigned long)summary.diag.opus_oversize,
+             (unsigned long)summary.diag.opus_malformed_fragments,
              (unsigned long)summary.diag.duplicate_packets,
              (unsigned long)summary.diag.stale_packets,
              (unsigned long)summary.diag.late_retry_packets,
@@ -460,13 +644,19 @@ static void downlink_begin_session(const downlink_item_t *item)
     s_active_codec = item->codec;
     s_active_sample_rate = sample_rate;
     s_last_output_sample = 0;
+    reset_playback_postfilter_locked();
     s_session_packets = 0;
-    s_session_adpcm_bytes = 0;
+    s_session_encoded_bytes = 0;
     s_session_pcm_samples_in = 0;
     s_session_pcm_samples_out = 0;
     memset(&s_diag, 0, sizeof(s_diag));
+    reset_opus_fragment_state();
     ring_clear_locked();
     portEXIT_CRITICAL(&s_lock);
+
+    if (item->codec == APP_AUDIO_CODEC_OPUS_24K && s_opus_decoder) {
+        esp_audio_dec_reset(s_opus_decoder);
+    }
 }
 
 static void mark_input_finished(void)
@@ -520,6 +710,111 @@ static void fill_underrun_tail(int16_t *chunk, uint16_t start, uint16_t total)
     s_last_output_sample = 0;
 }
 
+static uint16_t pcm_abs16(int16_t sample)
+{
+    if (sample == INT16_MIN) {
+        return 32768U;
+    }
+    return (uint16_t)(sample < 0 ? -sample : sample);
+}
+
+static void note_pcm_level(const int16_t *samples, uint16_t count, bool playback)
+{
+    uint16_t peak = 0;
+    uint32_t clip_samples = 0;
+
+    for (uint16_t i = 0; i < count; ++i) {
+        uint16_t mag = pcm_abs16(samples[i]);
+        if (mag > peak) {
+            peak = mag;
+        }
+        if (mag >= DOWNLINK_CLIP_SAMPLE_THRESHOLD) {
+            clip_samples++;
+        }
+    }
+
+    portENTER_CRITICAL(&s_lock);
+    if (playback) {
+        if (peak > s_diag.playback_peak) {
+            s_diag.playback_peak = peak;
+        }
+        s_diag.playback_clip_samples += clip_samples;
+    } else {
+        if (peak > s_diag.source_peak) {
+            s_diag.source_peak = peak;
+        }
+        s_diag.source_clip_samples += clip_samples;
+    }
+    portEXIT_CRITICAL(&s_lock);
+}
+
+static void apply_playback_postfilter(int16_t *samples, uint16_t count)
+{
+    if (count == 0 ||
+        (DOWNLINK_POSTFILTER_PREV_NUM == 0 &&
+         DOWNLINK_POSTFILTER_CUR_NUM == DOWNLINK_POSTFILTER_DEN)) {
+        return;
+    }
+
+    int32_t prev = s_postfilter_has_prev ? s_postfilter_prev_sample : samples[0];
+    for (uint16_t i = 0; i < count; ++i) {
+        int32_t current = samples[i];
+        int32_t filtered =
+            ((prev * DOWNLINK_POSTFILTER_PREV_NUM) +
+             (current * DOWNLINK_POSTFILTER_CUR_NUM)) /
+            DOWNLINK_POSTFILTER_DEN;
+        if (filtered > INT16_MAX) {
+            filtered = INT16_MAX;
+        } else if (filtered < INT16_MIN) {
+            filtered = INT16_MIN;
+        }
+        samples[i] = (int16_t)filtered;
+        prev = current;
+    }
+    s_postfilter_prev_sample = (int16_t)prev;
+    s_postfilter_has_prev = true;
+}
+
+static void apply_playback_gain(int16_t *samples, uint16_t count)
+{
+    uint8_t codec;
+    portENTER_CRITICAL(&s_lock);
+    codec = s_active_codec;
+    portEXIT_CRITICAL(&s_lock);
+
+    int gain_num = is_opus_codec(codec) ? DOWNLINK_OPUS_PLAYBACK_GAIN_NUM : DOWNLINK_ADPCM_PLAYBACK_GAIN_NUM;
+    int gain_den = is_opus_codec(codec) ? DOWNLINK_OPUS_PLAYBACK_GAIN_DEN : DOWNLINK_ADPCM_PLAYBACK_GAIN_DEN;
+    if (gain_num == gain_den) {
+        return;
+    }
+
+    for (uint16_t i = 0; i < count; ++i) {
+        int32_t scaled = ((int32_t)samples[i] * gain_num) / gain_den;
+        if (scaled > INT16_MAX) {
+            scaled = INT16_MAX;
+        } else if (scaled < INT16_MIN) {
+            scaled = INT16_MIN;
+        }
+        samples[i] = (int16_t)scaled;
+    }
+}
+
+static void playback_gain(uint8_t codec, int *num, int *den)
+{
+    if (is_opus_codec(codec)) {
+        *num = DOWNLINK_OPUS_PLAYBACK_GAIN_NUM;
+        *den = DOWNLINK_OPUS_PLAYBACK_GAIN_DEN;
+    } else {
+        *num = DOWNLINK_ADPCM_PLAYBACK_GAIN_NUM;
+        *den = DOWNLINK_ADPCM_PLAYBACK_GAIN_DEN;
+    }
+}
+
+static bool playback_uses_postfilter(uint8_t codec)
+{
+    return is_adpcm_codec(codec);
+}
+
 static void note_underrun(uint16_t session_id, uint16_t got, bool input_was_finished)
 {
     uint32_t count;
@@ -537,6 +832,107 @@ static void note_underrun(uint16_t session_id, uint16_t got, bool input_was_fini
                  ring_count(),
                  input_was_finished ? 1 : 0);
     }
+}
+
+static bool process_opus_item(const downlink_item_t *item)
+{
+    bool frame_start = (item->flags & DOWNLINK_FLAG_FRAME_START) != 0;
+    bool frame_end = (item->flags & DOWNLINK_FLAG_FRAME_END) != 0;
+
+    if (item->pcm_sample_count != DOWNLINK_OPUS_FRAME_SAMPLES ||
+        item->codec_param0 != 0 ||
+        item->codec_param1 != DOWNLINK_OPUS_FRAME_MS) {
+        portENTER_CRITICAL(&s_lock);
+        s_diag.invalid_packets++;
+        portEXIT_CRITICAL(&s_lock);
+        ESP_LOGW(TAG,
+                 "Downlink invalid Opus params sid=%u seq=%u pcm=%u param0=%u param1=%u",
+                 item->session_id,
+                 item->seq,
+                 item->pcm_sample_count,
+                 item->codec_param0,
+                 item->codec_param1);
+        return false;
+    }
+
+    if (frame_start) {
+        if (s_opus_frame_active) {
+            portENTER_CRITICAL(&s_lock);
+            s_diag.opus_malformed_fragments++;
+            portEXIT_CRITICAL(&s_lock);
+            ESP_LOGW(TAG, "Downlink Opus frame restarted before end sid=%u seq=%u", item->session_id, item->seq);
+            reset_opus_fragment_state();
+            return false;
+        }
+        reset_opus_fragment_state();
+        s_opus_frame_active = true;
+        s_opus_frame_pcm_samples = item->pcm_sample_count;
+    } else if (!s_opus_frame_active) {
+        portENTER_CRITICAL(&s_lock);
+        s_diag.opus_malformed_fragments++;
+        portEXIT_CRITICAL(&s_lock);
+        ESP_LOGW(TAG, "Downlink Opus fragment without frame start sid=%u seq=%u", item->session_id, item->seq);
+        return false;
+    }
+
+    if ((uint32_t)s_opus_frame_len + item->payload_len > DOWNLINK_OPUS_MAX_FRAME_BYTES) {
+        portENTER_CRITICAL(&s_lock);
+        s_diag.opus_oversize++;
+        portEXIT_CRITICAL(&s_lock);
+        ESP_LOGW(TAG,
+                 "Downlink Opus frame oversize sid=%u seq=%u len=%u add=%u",
+                 item->session_id,
+                 item->seq,
+                 s_opus_frame_len,
+                 item->payload_len);
+        reset_opus_fragment_state();
+        return false;
+    }
+
+    memcpy(s_opus_frame + s_opus_frame_len, item->payload, item->payload_len);
+    s_opus_frame_len += item->payload_len;
+    portENTER_CRITICAL(&s_lock);
+    s_diag.opus_fragments++;
+    portEXIT_CRITICAL(&s_lock);
+
+    if (frame_end) {
+        uint16_t decoded_count = 0;
+        if (!decode_opus_frame(s_opus_pcm, &decoded_count)) {
+            portENTER_CRITICAL(&s_lock);
+            s_diag.opus_decode_fail++;
+            portEXIT_CRITICAL(&s_lock);
+            reset_opus_fragment_state();
+            return false;
+        }
+
+        portENTER_CRITICAL(&s_lock);
+        s_diag.opus_frames++;
+        s_session_pcm_samples_in += decoded_count;
+        s_session_pcm_samples_out += decoded_count;
+        portEXIT_CRITICAL(&s_lock);
+        note_pcm_level(s_opus_pcm, decoded_count, false);
+
+        if (!ring_write_all(item->session_id, s_opus_pcm, decoded_count)) {
+            ESP_LOGW(TAG, "Downlink Opus ring write failed sid=%u seq=%u out=%u", item->session_id, item->seq, decoded_count);
+            reset_opus_fragment_state();
+            return false;
+        }
+        reset_opus_fragment_state();
+    }
+
+    if ((item->flags & DOWNLINK_FLAG_END) != 0) {
+        if (s_opus_frame_active) {
+            portENTER_CRITICAL(&s_lock);
+            s_diag.opus_malformed_fragments++;
+            portEXIT_CRITICAL(&s_lock);
+            ESP_LOGW(TAG, "Downlink Opus stream ended with partial frame sid=%u seq=%u", item->session_id, item->seq);
+            reset_opus_fragment_state();
+            return false;
+        }
+        mark_input_finished();
+    }
+
+    return true;
 }
 
 static void downlink_rx_task(void *arg)
@@ -611,7 +1007,7 @@ static void downlink_rx_task(void *arg)
         portENTER_CRITICAL(&s_lock);
         s_expected_seq++;
         s_session_packets++;
-        s_session_adpcm_bytes += item.payload_len;
+        s_session_encoded_bytes += item.payload_len;
         portEXIT_CRITICAL(&s_lock);
 
         uint32_t source_rate = codec_sample_rate(item.codec);
@@ -620,6 +1016,13 @@ static void downlink_rx_task(void *arg)
             s_diag.unsupported_codec++;
             portEXIT_CRITICAL(&s_lock);
             downlink_emit_done(item.session_id, DOWNLINK_STATUS_PLAYBACK_FAIL);
+            continue;
+        }
+
+        if (is_opus_codec(item.codec)) {
+            if (!process_opus_item(&item)) {
+                downlink_emit_done(item.session_id, DOWNLINK_STATUS_PLAYBACK_FAIL);
+            }
             continue;
         }
 
@@ -634,7 +1037,7 @@ static void downlink_rx_task(void *arg)
                      item.seq,
                      item.pcm_sample_count,
                      item.payload_len,
-                     item.step_index);
+                     item.codec_param1);
             downlink_emit_done(item.session_id, DOWNLINK_STATUS_PLAYBACK_FAIL);
             continue;
         }
@@ -658,6 +1061,7 @@ static void downlink_rx_task(void *arg)
         s_session_pcm_samples_in += decoded_count;
         s_session_pcm_samples_out += output_count;
         portEXIT_CRITICAL(&s_lock);
+        note_pcm_level(s_resample_pcm, output_count, false);
 
         if (!ring_write_all(item.session_id, s_resample_pcm, output_count)) {
             ESP_LOGW(TAG, "Downlink ring write failed sid=%u seq=%u out=%u", item.session_id, item.seq, output_count);
@@ -701,12 +1105,23 @@ static void downlink_playback_task(void *arg)
                 mark_playback_started();
                 last_wake = xTaskGetTickCount();
                 cadence_active = true;
+                uint8_t codec;
+                portENTER_CRITICAL(&s_lock);
+                codec = s_active_codec;
+                portEXIT_CRITICAL(&s_lock);
+                int gain_num = 1;
+                int gain_den = 1;
+                playback_gain(codec, &gain_num, &gain_den);
                 ESP_LOGI(TAG,
-                         "Downlink playback start sid=%u rate=%lu buffered=%u prebuffer=%u",
+                         "Downlink playback start sid=%u codec=0x%02X rate=%lu buffered=%u prebuffer=%u gain=%d/%d postfilter=%d",
                          session_id,
+                         codec,
                          (unsigned long)sample_rate,
                          buffered,
-                         prebuffer_samples);
+                         prebuffer_samples,
+                         gain_num,
+                         gain_den,
+                         playback_uses_postfilter(codec) ? 1 : 0);
             } else if (finished && buffered == 0) {
                 cadence_active = false;
                 downlink_emit_done(session_id, DOWNLINK_STATUS_OK);
@@ -741,6 +1156,15 @@ static void downlink_playback_task(void *arg)
         }
 
         if (got > 0) {
+            uint8_t codec;
+            portENTER_CRITICAL(&s_lock);
+            codec = s_active_codec;
+            portEXIT_CRITICAL(&s_lock);
+            if (playback_uses_postfilter(codec)) {
+                apply_playback_postfilter(chunk, got);
+            }
+            apply_playback_gain(chunk, got);
+            note_pcm_level(chunk, got, true);
             bool play_ok = Audio_Play_PCM16_Mono(chunk, got, sample_rate);
             if (!play_ok) {
                 portENTER_CRITICAL(&s_lock);
@@ -788,15 +1212,17 @@ esp_err_t app_audio_downlink_init(app_audio_downlink_done_cb_t done_cb)
     }
 
     if (!s_rx_task) {
-        BaseType_t ok = xTaskCreatePinnedToCore(
+        BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(
             downlink_rx_task,
             "app_downlink_rx",
             DOWNLINK_RX_TASK_STACK,
             NULL,
             DOWNLINK_TASK_PRIO,
             &s_rx_task,
-            1);
+            1,
+            DOWNLINK_RX_TASK_STACK_CAPS);
         if (ok != pdPASS) {
+            log_task_create_failed("app_downlink_rx", DOWNLINK_RX_TASK_STACK, DOWNLINK_RX_TASK_STACK_CAPS);
             return ESP_ERR_NO_MEM;
         }
     }
@@ -811,6 +1237,7 @@ esp_err_t app_audio_downlink_init(app_audio_downlink_done_cb_t done_cb)
             &s_play_task,
             1);
         if (ok != pdPASS) {
+            log_task_create_failed("app_downlink_play", DOWNLINK_PLAY_TASK_STACK, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
             return ESP_ERR_NO_MEM;
         }
     }
@@ -824,16 +1251,27 @@ bool app_audio_downlink_enqueue(uint16_t session_id,
                                 uint8_t flags,
                                 uint8_t codec,
                                 uint16_t pcm_sample_count,
-                                int16_t predictor,
-                                uint8_t step_index,
+                                uint16_t codec_param0,
+                                uint8_t codec_param1,
                                 const uint8_t *payload,
                                 uint16_t payload_len)
 {
-    if (!s_queue || !payload || payload_len == 0 || payload_len > APP_AUDIO_DOWNLINK_MAX_ADPCM_BYTES) {
+    if (!s_queue || !payload || payload_len == 0 || payload_len > APP_AUDIO_DOWNLINK_MAX_PAYLOAD_BYTES) {
         return false;
     }
-    if (pcm_sample_count == 0 || pcm_sample_count > (uint16_t)(payload_len * 2) || step_index > 88) {
+    if (pcm_sample_count == 0) {
         return false;
+    }
+    if (is_adpcm_codec(codec)) {
+        if (pcm_sample_count > (uint16_t)(payload_len * 2) || codec_param1 > 88) {
+            return false;
+        }
+    } else if (is_opus_codec(codec)) {
+        if (pcm_sample_count != DOWNLINK_OPUS_FRAME_SAMPLES ||
+            codec_param0 != 0 ||
+            codec_param1 != DOWNLINK_OPUS_FRAME_MS) {
+            return false;
+        }
     }
 
     if (flags & DOWNLINK_FLAG_START) {
@@ -847,8 +1285,8 @@ bool app_audio_downlink_enqueue(uint16_t session_id,
     item.flags = flags;
     item.codec = codec;
     item.pcm_sample_count = pcm_sample_count;
-    item.predictor = predictor;
-    item.step_index = step_index;
+    item.codec_param0 = codec_param0;
+    item.codec_param1 = codec_param1;
     item.payload_len = payload_len;
     memcpy(item.payload, payload, payload_len);
 
@@ -871,11 +1309,13 @@ void app_audio_downlink_reset(void)
     s_active_codec = APP_AUDIO_CODEC_IMA_ADPCM_16K;
     s_active_sample_rate = APP_AUDIO_SAMPLE_RATE_16K;
     s_last_output_sample = 0;
+    reset_playback_postfilter_locked();
     s_session_packets = 0;
-    s_session_adpcm_bytes = 0;
+    s_session_encoded_bytes = 0;
     s_session_pcm_samples_in = 0;
     s_session_pcm_samples_out = 0;
     memset(&s_diag, 0, sizeof(s_diag));
+    reset_opus_fragment_state();
     ring_clear_locked();
     portEXIT_CRITICAL(&s_lock);
 }

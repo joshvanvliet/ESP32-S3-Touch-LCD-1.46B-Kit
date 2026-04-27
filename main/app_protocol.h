@@ -10,12 +10,13 @@
 #define APP_GATT_RESULT_UUID  "7f5a0005-5d7f-4f51-9ed4-30f4b6d90000"
 #define APP_GATT_AUDIO_DOWNLINK_UUID "7f5a0006-5d7f-4f51-9ed4-30f4b6d90000"
 
-#define APP_PROTOCOL_VERSION 0x05
+#define APP_PROTOCOL_VERSION 0x06
 
 #define APP_AUDIO_CODEC_IMA_ADPCM_16K 0x01
 #define APP_AUDIO_CODEC_IMA_ADPCM_12K 0x02
 #define APP_AUDIO_CODEC_IMA_ADPCM_8K  0x03
 #define APP_AUDIO_CODEC_IMA_ADPCM_24K 0x04
+#define APP_AUDIO_CODEC_OPUS_24K      0x05
 
 #define APP_MAX_TRANSCRIPT_BYTES 60
 #define APP_AUDIO_FRAME_MS 20
@@ -26,7 +27,7 @@
 #define APP_AUDIO_MAX_SAMPLE_RATE APP_AUDIO_SAMPLE_RATE_16K
 #define APP_AUDIO_MAX_PCM_SAMPLES_PER_FRAME ((APP_AUDIO_MAX_SAMPLE_RATE * APP_AUDIO_FRAME_MS) / 1000)
 #define APP_AUDIO_MAX_ADPCM_BYTES (APP_AUDIO_MAX_PCM_SAMPLES_PER_FRAME / 2)
-#define APP_AUDIO_DOWNLINK_MAX_ADPCM_BYTES 180
+#define APP_AUDIO_DOWNLINK_MAX_PAYLOAD_BYTES 180
 
 typedef enum {
     APP_STATE_UNPAIRED = 0,
@@ -88,8 +89,8 @@ typedef struct __attribute__((packed)) {
     uint8_t codec;
     uint16_t payload_len;
     uint16_t pcm_sample_count;
-    int16_t predictor;
-    uint8_t step_index;
+    uint16_t codec_param0;
+    uint8_t codec_param1;
     uint8_t reserved;
 } app_audio_downlink_packet_header_t;
 
