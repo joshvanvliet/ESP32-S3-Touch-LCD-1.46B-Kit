@@ -260,11 +260,16 @@ static void app_state_try_wake_rearm(void)
     if (!app_state_wake_allowed() || app_wakeword_is_running()) {
         return;
     }
+    app_audio_downlink_release_transient_resources();
+    app_state_log_internal_heap("Before WakeNet rearm");
     esp_err_t err = app_wakeword_start();
     if (err == ESP_OK) {
         app_ui_set_status_text("Wake listening");
     } else {
         ESP_LOGW(TAG, "WakeNet start failed: %s", esp_err_to_name(err));
+        if (err == ESP_ERR_NO_MEM) {
+            app_state_schedule_wake_rearm(3000);
+        }
     }
 }
 
@@ -946,6 +951,7 @@ static void app_state_handle_event(const app_event_t *ev)
 #if CONFIG_APP_WAKEWORD_ENABLED
             s_agent_activity_busy = false;
 #endif
+            app_ui_set_agent_activity(APP_AGENT_ACTIVITY_IDLE);
             app_ble_link_notify_audio_downlink_done(ev->data.downlink_done.session_id, ev->data.downlink_done.status);
             if (ev->data.downlink_done.status == 0) {
                 app_ui_set_status_text("Playback complete");

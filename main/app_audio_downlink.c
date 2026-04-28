@@ -315,6 +315,22 @@ static bool ensure_opus_decoder(void)
     return true;
 }
 
+void app_audio_downlink_release_transient_resources(void)
+{
+    if (app_audio_downlink_active()) {
+        return;
+    }
+    reset_opus_fragment_state();
+    if (s_opus_decoder) {
+        esp_audio_dec_close(s_opus_decoder);
+        s_opus_decoder = NULL;
+        ESP_LOGI(TAG,
+                 "Released Opus decoder before idle wake rearm internal_free=%lu internal_largest=%lu",
+                 (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    }
+}
+
 static bool decode_opus_frame(int16_t *out, uint16_t *out_len)
 {
     *out_len = 0;

@@ -19,6 +19,7 @@ bool app_audio_downlink_enqueue(uint16_t session_id,
                                 const uint8_t *payload,
                                 uint16_t payload_len);
 void app_audio_downlink_reset(void);
+void app_audio_downlink_release_transient_resources(void);
 bool app_audio_downlink_active(void);
 uint8_t app_audio_downlink_queue_free_slots(void);
 uint8_t app_audio_downlink_available_credits(void);

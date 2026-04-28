@@ -11,6 +11,7 @@
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
 #include "esp_afe_sr_models.h"
+#include "esp_heap_caps.h"
 #include "esp_wn_models.h"
 #include "model_path.h"
 
@@ -22,6 +23,8 @@
 #define WAKE_TASK_CORE 0
 #define WAKE_FEED_STOP_WAIT_MS 1200
 #define WAKE_I2S_USE_RIGHT_SLOT 1
+#define WAKE_MIN_INTERNAL_FREE_BYTES 40000
+#define WAKE_MIN_INTERNAL_LARGEST_BYTES 20000
 
 static const char *TAG = "APP_WAKE";
 
@@ -35,6 +38,45 @@ static TaskHandle_t s_detect_task;
 static volatile bool s_running;
 static volatile bool s_stop_requested;
 static volatile bool s_detected;
+
+static void wake_log_heap(const char *phase, size_t *internal_free_out, size_t *internal_largest_out)
+{
+    size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t internal_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    size_t psram_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    ESP_LOGI(TAG,
+             "%s heap internal_free=%lu internal_largest=%lu psram_free=%lu psram_largest=%lu",
+             phase,
+             (unsigned long)internal_free,
+             (unsigned long)internal_largest,
+             (unsigned long)psram_free,
+             (unsigned long)psram_largest);
+    if (internal_free_out) {
+        *internal_free_out = internal_free;
+    }
+    if (internal_largest_out) {
+        *internal_largest_out = internal_largest;
+    }
+}
+
+static bool wake_internal_heap_ready(const char *phase)
+{
+    size_t internal_free = 0;
+    size_t internal_largest = 0;
+    wake_log_heap(phase, &internal_free, &internal_largest);
+    if (internal_free < WAKE_MIN_INTERNAL_FREE_BYTES ||
+        internal_largest < WAKE_MIN_INTERNAL_LARGEST_BYTES) {
+        ESP_LOGW(TAG,
+                 "WakeNet start deferred: internal heap too low free=%lu/%u largest=%lu/%u",
+                 (unsigned long)internal_free,
+                 WAKE_MIN_INTERNAL_FREE_BYTES,
+                 (unsigned long)internal_largest,
+                 WAKE_MIN_INTERNAL_LARGEST_BYTES);
+        return false;
+    }
+    return true;
+}
 
 static esp_err_t wake_i2s_init(void)
 {
@@ -209,6 +251,10 @@ esp_err_t app_wakeword_start(void)
         return ESP_OK;
     }
 
+    if (!wake_internal_heap_ready("Before WakeNet start")) {
+        return ESP_ERR_NO_MEM;
+    }
+
     s_afe_handle = &ESP_AFE_SR_HANDLE;
     s_models = esp_srmodel_init("model");
     if (!s_models) {
@@ -250,6 +296,7 @@ esp_err_t app_wakeword_start(void)
         wake_cleanup_resources();
         return ESP_FAIL;
     }
+    wake_log_heap("After WakeNet AFE create", NULL, NULL);
     esp_err_t ret = wake_i2s_init();
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "WakeNet I2S init failed: %s", esp_err_to_name(ret));
