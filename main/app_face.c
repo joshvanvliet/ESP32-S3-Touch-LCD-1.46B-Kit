@@ -6,7 +6,8 @@
 
 #include "Display_SPD2010.h"
 #include "app_face_canvas.h"
-#include "app_lcd.h"
+#include "app_face_blit.h"
+#include "app_face_dirty.h"
 #include "app_face_math.h"
 #include "app_motion.h"
 #include "esp_heap_caps.h"
@@ -53,18 +54,10 @@ static const char *TAG = "APP_FACE";
 
 #define APP_FACE_TX_BUFFER_BYTES CONFIG_APP_FACE_TX_BUFFER_BYTES
 #define APP_FACE_TX_BUFFER_COUNT CONFIG_APP_FACE_TX_BUFFER_COUNT
-#define APP_FACE_MAX_DIRTY_RECTS 10
-#define APP_FACE_MAX_BLIT_FRAGMENTS 16
 #define APP_FACE_MAX_PROTECTED_RECTS 4
-#define APP_FACE_DIRTY_MERGE_GAP 3
 #define APP_FACE_PRIMITIVE_MARGIN_PX 3
 #define APP_FACE_INPUT_ENERGY_SCALE 0.5f
 #define APP_FACE_SPEAKING_INPUT_ENERGY_CAP 0.48f
-
-typedef struct {
-    lv_area_t rects[APP_FACE_MAX_DIRTY_RECTS];
-    size_t count;
-} app_face_dirty_list_t;
 
 typedef enum {
     APP_FACE_GAZE_IDLE,
@@ -181,6 +174,9 @@ typedef struct {
     app_face_mode_t target_mode;
     app_face_mode_t base_mode;
     app_face_mode_t pulse_return_mode;
+    app_face_mood_numbers_t transition_from_mood;
+    app_face_rgb_t transition_from_iris;
+    app_face_rgb_t transition_from_pupil;
     bool pulse_active;
     bool base_dirty;
     bool has_prev_dynamic_list;
@@ -253,6 +249,12 @@ static uint8_t alpha_from_float(float alpha)
     return (uint8_t)(app_face_clampf(alpha, 0.0f, 1.0f) * 255.0f);
 }
 
+static float follow_response(float response_hz, float seconds)
+{
+    float hz = fmaxf(response_hz, 0.01f);
+    return app_face_clampf(1.0f - expf(-seconds * hz), 0.0f, 1.0f);
+}
+
 static float speaking_energy_cap(void)
 {
     return APP_FACE_SPEAKING_INPUT_ENERGY_CAP * APP_FACE_INPUT_ENERGY_SCALE;
@@ -266,181 +268,6 @@ static void apply_speaking_energy_cap(app_face_mode_t mode)
     float cap = speaking_energy_cap();
     s_face.energy = fminf(s_face.energy, cap);
     s_face.target_energy = fminf(s_face.target_energy, cap);
-}
-
-static int clamp_int(int value, int min_value, int max_value)
-{
-    if (value < min_value) {
-        return min_value;
-    }
-    if (value > max_value) {
-        return max_value;
-    }
-    return value;
-}
-
-static void area_reset(lv_area_t *area, int width, int height)
-{
-    area->x1 = width;
-    area->y1 = height;
-    area->x2 = -1;
-    area->y2 = -1;
-}
-
-static bool area_is_empty(const lv_area_t *area)
-{
-    return area->x1 > area->x2 || area->y1 > area->y2;
-}
-
-static void area_include_rect(lv_area_t *area, float x1, float y1, float x2, float y2)
-{
-    int ix1 = (int)floorf(fminf(x1, x2));
-    int iy1 = (int)floorf(fminf(y1, y2));
-    int ix2 = (int)ceilf(fmaxf(x1, x2));
-    int iy2 = (int)ceilf(fmaxf(y1, y2));
-    if (area_is_empty(area)) {
-        area->x1 = ix1;
-        area->y1 = iy1;
-        area->x2 = ix2;
-        area->y2 = iy2;
-        return;
-    }
-    area->x1 = area->x1 < ix1 ? area->x1 : ix1;
-    area->y1 = area->y1 < iy1 ? area->y1 : iy1;
-    area->x2 = area->x2 > ix2 ? area->x2 : ix2;
-    area->y2 = area->y2 > iy2 ? area->y2 : iy2;
-}
-
-static void area_include_area(lv_area_t *area, const lv_area_t *other)
-{
-    if (area_is_empty(other)) {
-        return;
-    }
-    area_include_rect(area, other->x1, other->y1, other->x2, other->y2);
-}
-
-static void area_include_transformed_ellipse(lv_area_t *area,
-                                             float cx,
-                                             float cy,
-                                             float ux,
-                                             float uy,
-                                             float vx,
-                                             float vy,
-                                             float rx,
-                                             float ry,
-                                             float margin)
-{
-    float half_x = fabsf(ux) * rx + fabsf(vx) * ry + margin;
-    float half_y = fabsf(uy) * rx + fabsf(vy) * ry + margin;
-    area_include_rect(area, cx - half_x, cy - half_y, cx + half_x, cy + half_y);
-}
-
-static void area_inflate_clip(lv_area_t *area, int margin, int width, int height)
-{
-    if (area_is_empty(area)) {
-        area->x1 = 0;
-        area->y1 = 0;
-        area->x2 = width - 1;
-        area->y2 = height - 1;
-        return;
-    }
-    area->x1 = clamp_int(area->x1 - margin, 0, width - 1);
-    area->y1 = clamp_int(area->y1 - margin, 0, height - 1);
-    area->x2 = clamp_int(area->x2 + margin, 0, width - 1);
-    area->y2 = clamp_int(area->y2 + margin, 0, height - 1);
-    area->x1 = (area->x1 >> 2) << 2;
-    area->x2 = clamp_int(((area->x2 >> 2) << 2) + 3, 0, width - 1);
-}
-
-static bool area_clip_to_bounds(lv_area_t *area, int width, int height)
-{
-    if (area_is_empty(area)) {
-        return false;
-    }
-    area->x1 = clamp_int(area->x1, 0, width - 1);
-    area->y1 = clamp_int(area->y1, 0, height - 1);
-    area->x2 = clamp_int(area->x2, 0, width - 1);
-    area->y2 = clamp_int(area->y2, 0, height - 1);
-    area->x1 = (area->x1 >> 2) << 2;
-    area->x2 = clamp_int(((area->x2 >> 2) << 2) + 3, 0, width - 1);
-    return !area_is_empty(area);
-}
-
-static int area_width(const lv_area_t *area)
-{
-    return area_is_empty(area) ? 0 : (int)(area->x2 - area->x1 + 1);
-}
-
-static int area_height(const lv_area_t *area)
-{
-    return area_is_empty(area) ? 0 : (int)(area->y2 - area->y1 + 1);
-}
-
-static uint32_t area_pixel_count(const lv_area_t *area)
-{
-    return (uint32_t)area_width(area) * (uint32_t)area_height(area);
-}
-
-static bool area_intersects(const lv_area_t *a, const lv_area_t *b)
-{
-    return !area_is_empty(a) && !area_is_empty(b) &&
-           a->x1 <= b->x2 && a->x2 >= b->x1 && a->y1 <= b->y2 && a->y2 >= b->y1;
-}
-
-static bool area_near_or_overlaps(const lv_area_t *a, const lv_area_t *b, int gap)
-{
-    if (area_is_empty(a) || area_is_empty(b)) {
-        return false;
-    }
-    return a->x1 <= b->x2 + gap && a->x2 + gap >= b->x1 &&
-           a->y1 <= b->y2 + gap && a->y2 + gap >= b->y1;
-}
-
-static void dirty_list_reset(app_face_dirty_list_t *list)
-{
-    list->count = 0;
-}
-
-static void dirty_list_add_area(app_face_dirty_list_t *list, lv_area_t area, int width, int height)
-{
-    if (!area_clip_to_bounds(&area, width, height)) {
-        return;
-    }
-
-    for (size_t i = 0; i < list->count; i++) {
-        if (area_near_or_overlaps(&list->rects[i], &area, APP_FACE_DIRTY_MERGE_GAP)) {
-            area_include_area(&list->rects[i], &area);
-            area_clip_to_bounds(&list->rects[i], width, height);
-            return;
-        }
-    }
-
-    if (list->count < APP_FACE_MAX_DIRTY_RECTS) {
-        list->rects[list->count++] = area;
-        return;
-    }
-
-    size_t smallest = 0;
-    uint32_t smallest_pixels = UINT32_MAX;
-    for (size_t i = 0; i < list->count; i++) {
-        uint32_t pixels = area_pixel_count(&list->rects[i]);
-        if (pixels < smallest_pixels) {
-            smallest_pixels = pixels;
-            smallest = i;
-        }
-    }
-    area_include_area(&list->rects[smallest], &area);
-    area_clip_to_bounds(&list->rects[smallest], width, height);
-}
-
-static void dirty_list_add_list(app_face_dirty_list_t *dst,
-                                const app_face_dirty_list_t *src,
-                                int width,
-                                int height)
-{
-    for (size_t i = 0; i < src->count; i++) {
-        dirty_list_add_area(dst, src->rects[i], width, height);
-    }
 }
 
 static void schedule_next_gaze(uint32_t now_ms)
@@ -517,8 +344,19 @@ static void sample_gaze_motion(uint32_t now_ms)
 static void update_gaze(uint32_t now_ms, bool allowed)
 {
     if (!allowed) {
-        reset_gaze(now_ms);
-        schedule_next_gaze(now_ms);
+        bool centered = fabsf(s_face.gaze.x) < 0.001f && fabsf(s_face.gaze.y) < 0.001f;
+        if (centered && s_face.gaze.phase == APP_FACE_GAZE_IDLE) {
+            schedule_next_gaze(now_ms);
+            return;
+        }
+        if (s_face.gaze.phase != APP_FACE_GAZE_RETURNING) {
+            begin_gaze_return(now_ms);
+        }
+        sample_gaze_motion(now_ms);
+        if (elapsed_ms(now_ms, s_face.gaze.phase_end_ms) < 0x80000000u) {
+            reset_gaze(now_ms);
+            schedule_next_gaze(now_ms);
+        }
         return;
     }
     if (s_face.gaze.phase == APP_FACE_GAZE_IDLE && elapsed_ms(now_ms, s_face.gaze.next_at_ms) < 0x80000000u) {
@@ -561,11 +399,23 @@ static app_face_energy_profile_t energy_profile(void)
     };
 }
 
+static void current_style(uint32_t now_ms,
+                          app_face_mood_numbers_t *mood,
+                          app_face_rgb_t *iris,
+                          app_face_rgb_t *pupil);
+
 static void set_transition_target(app_face_mode_t mode, uint32_t now_ms)
 {
     if (mode < 0 || mode >= APP_FACE_MODE_COUNT || s_face.target_mode == mode) {
         return;
     }
+    app_face_mood_numbers_t current_mood;
+    app_face_rgb_t current_iris;
+    app_face_rgb_t current_pupil;
+    current_style(now_ms, &current_mood, &current_iris, &current_pupil);
+    s_face.transition_from_mood = current_mood;
+    s_face.transition_from_iris = current_iris;
+    s_face.transition_from_pupil = current_pupil;
     s_face.previous_mode = s_face.target_mode;
     s_face.target_mode = mode;
     s_face.transition_start_ms = now_ms;
@@ -578,13 +428,12 @@ static void current_style(uint32_t now_ms,
                           app_face_rgb_t *iris,
                           app_face_rgb_t *pupil)
 {
-    const app_face_mode_style_t *from = &APP_FACE_MODE_STYLES[s_face.previous_mode];
     const app_face_mode_style_t *to = &APP_FACE_MODE_STYLES[s_face.target_mode];
     float t = (float)elapsed_ms(now_ms, s_face.transition_start_ms) / (float)APP_FACE_DEFAULT_CONFIG.motion.transition_ms;
-    t = app_face_smoothf(t);
-    *mood = app_face_mood_lerp(&from->v, &to->v, t);
-    *iris = app_face_rgb_lerp(from->iris, to->iris, t);
-    *pupil = app_face_rgb_lerp(from->pupil, to->pupil, t);
+    t = app_face_min_jerk(t);
+    *mood = app_face_mood_lerp(&s_face.transition_from_mood, &to->v, t);
+    *iris = app_face_rgb_lerp(s_face.transition_from_iris, to->iris, t);
+    *pupil = app_face_rgb_lerp(s_face.transition_from_pupil, to->pupil, t);
 }
 
 static app_face_orientation_t orientation3d(const app_face_mood_numbers_t *mood, float nod)
@@ -892,7 +741,7 @@ static void compute_draw_layout(const app_face_canvas_t *canvas,
     float nod = mood->nod * sinf(s_face.time_s * (APP_FACE_DEFAULT_CONFIG.motion.nod_frequency_base +
                                                   energy->raw * APP_FACE_DEFAULT_CONFIG.motion.nod_frequency_energy));
     float voice = mood->bounce * energy->bounce;
-    float voice_beat = app_face_clampf(sinf(s_face.time_s * 11.8f) * sinf(s_face.time_s * 7.1f + 2.0f) * voice, -0.82f, 0.82f);
+    float voice_beat = app_face_clampf(sinf(s_face.time_s * 7.2f) * sinf(s_face.time_s * 4.6f + 2.0f) * voice, -0.56f, 0.56f);
     float eye_breath_y = sinf(s_face.time_s * 3.3f) * scale * 0.006f * mood->pulse * energy->pulse;
     float face_motion_y = sinf(s_face.time_s * 2.1f) * scale * 0.003f * mood->bob + nod * scale * 0.008f;
     app_face_orientation_t orientation = orientation3d(mood, nod);
@@ -1034,18 +883,6 @@ static lv_area_t display_dirty_area(const app_face_canvas_t *canvas, const app_f
     };
     area_clip_to_bounds(&area, canvas->width, canvas->height);
     return area;
-}
-
-static bool clip_area_to_area(lv_area_t *area, const lv_area_t *clip, int width, int height)
-{
-    if (area_is_empty(area) || area_is_empty(clip)) {
-        return false;
-    }
-    area->x1 = clamp_int(area->x1, clip->x1, clip->x2);
-    area->y1 = clamp_int(area->y1, clip->y1, clip->y2);
-    area->x2 = clamp_int(area->x2, clip->x1, clip->x2);
-    area->y2 = clamp_int(area->y2, clip->y1, clip->y2);
-    return area_clip_to_bounds(area, width, height);
 }
 
 static void render_plan_reset(app_face_render_plan_t *plan)
@@ -1251,9 +1088,9 @@ static void build_render_plan(const app_face_canvas_t *canvas,
         float alpha = (0.26f + 0.38f * energy->lively) * mood->speaking_bars * frame.visibility;
         for (int i = 0; i < 7; i++) {
             float local_x = start + (float)i * (total / 6.0f);
-            float amp = fabsf(sinf(s_face.time_s * (7.0f + energy->raw * 18.0f) + (float)i * 0.72f)) *
-                            layout->radius * (0.05f + 0.13f * energy->lively) +
-                        layout->radius * 0.02f;
+            float wave = 0.5f + 0.5f * sinf(s_face.time_s * (5.2f + energy->raw * 9.0f) + (float)i * 0.72f);
+            float amp = app_face_smoothf(wave) * layout->radius * (0.04f + 0.085f * energy->lively) +
+                        layout->radius * 0.024f;
             float bar_x;
             float bar_y;
             pair_frame_point(layout, &frame, local_x, local_y, &bar_x, &bar_y);
@@ -1318,161 +1155,6 @@ static void draw_render_plan(app_face_canvas_t *canvas,
                                                      primitive->alpha);
         }
     }
-}
-
-static void fragment_list_add(lv_area_t *fragments, size_t *count, const lv_area_t *area)
-{
-    if (area_is_empty(area) || *count >= APP_FACE_MAX_BLIT_FRAGMENTS) {
-        return;
-    }
-    fragments[(*count)++] = *area;
-}
-
-static size_t subtract_protected_areas(const lv_area_t *area, lv_area_t *out_fragments, size_t max_fragments)
-{
-    if (area_is_empty(area) || max_fragments == 0) {
-        return 0;
-    }
-
-    lv_area_t fragments[APP_FACE_MAX_BLIT_FRAGMENTS];
-    size_t fragment_count = 1;
-    fragments[0] = *area;
-
-    for (size_t p = 0; p < s_face.protected_area_count; p++) {
-        lv_area_t protect = s_face.protected_areas[p];
-        area_inflate_clip(&protect, 2, s_face.canvas.width, s_face.canvas.height);
-        if (area_is_empty(&protect)) {
-            continue;
-        }
-
-        lv_area_t next[APP_FACE_MAX_BLIT_FRAGMENTS];
-        size_t next_count = 0;
-        for (size_t i = 0; i < fragment_count; i++) {
-            lv_area_t src = fragments[i];
-            if (!area_intersects(&src, &protect)) {
-                fragment_list_add(next, &next_count, &src);
-                continue;
-            }
-
-            lv_area_t top = src;
-            top.y2 = protect.y1 - 1;
-            fragment_list_add(next, &next_count, &top);
-
-            lv_area_t bottom = src;
-            bottom.y1 = protect.y2 + 1;
-            fragment_list_add(next, &next_count, &bottom);
-
-            lv_area_t left = src;
-            left.y1 = fmax(src.y1, protect.y1);
-            left.y2 = fmin(src.y2, protect.y2);
-            left.x2 = protect.x1 - 1;
-            fragment_list_add(next, &next_count, &left);
-
-            lv_area_t right = src;
-            right.y1 = fmax(src.y1, protect.y1);
-            right.y2 = fmin(src.y2, protect.y2);
-            right.x1 = protect.x2 + 1;
-            fragment_list_add(next, &next_count, &right);
-        }
-        memcpy(fragments, next, next_count * sizeof(fragments[0]));
-        fragment_count = next_count;
-        if (fragment_count == 0) {
-            break;
-        }
-    }
-
-    size_t copied = fragment_count < max_fragments ? fragment_count : max_fragments;
-    memcpy(out_fragments, fragments, copied * sizeof(out_fragments[0]));
-    return copied;
-}
-
-static esp_err_t blit_area_from_framebuffer(const lv_area_t *area,
-                                            uint32_t *packed_bytes,
-                                            uint32_t *pack_time_us,
-                                            uint32_t *lcd_chunk_count,
-                                            uint32_t *lcd_wait_us)
-{
-    if (area_is_empty(area) || !s_face.tx_buffers[0]) {
-        return ESP_OK;
-    }
-
-    const int width = area_width(area);
-    if (width <= 0 || area_height(area) <= 0) {
-        return ESP_OK;
-    }
-
-    const int pixels_per_buffer = APP_FACE_TX_BUFFER_BYTES / (int)sizeof(lv_color_t);
-    int rows_per_chunk = pixels_per_buffer / width;
-    if (rows_per_chunk < 1) {
-        rows_per_chunk = 1;
-    }
-
-    for (int y = area->y1; y <= area->y2; y += rows_per_chunk) {
-        int rows = area->y2 - y + 1;
-        if (rows > rows_per_chunk) {
-            rows = rows_per_chunk;
-        }
-
-        int64_t wait_start = esp_timer_get_time();
-        esp_err_t err = app_lcd_wait_idle(UINT32_MAX);
-        if (lcd_wait_us) {
-            *lcd_wait_us += (uint32_t)(esp_timer_get_time() - wait_start);
-        }
-        if (err != ESP_OK) {
-            return err;
-        }
-
-        lv_color_t *tx = s_face.tx_buffers[s_face.tx_index % APP_FACE_TX_BUFFER_COUNT];
-        s_face.tx_index++;
-        size_t row_bytes = (size_t)width * sizeof(lv_color_t);
-        int64_t pack_start = esp_timer_get_time();
-        for (int row = 0; row < rows; row++) {
-            memcpy(&tx[row * width],
-                   &s_face.pixels[(y + row) * s_face.canvas.width + area->x1],
-                   row_bytes);
-        }
-        if (pack_time_us) {
-            *pack_time_us += (uint32_t)(esp_timer_get_time() - pack_start);
-        }
-
-        if (packed_bytes) {
-            *packed_bytes += (uint32_t)(row_bytes * (size_t)rows);
-        }
-        if (lcd_chunk_count) {
-            (*lcd_chunk_count)++;
-        }
-        err = app_lcd_blit_rect_async(area->x1, y, width, rows, tx, NULL, NULL);
-        if (err != ESP_OK) {
-            return err;
-        }
-    }
-    return ESP_OK;
-}
-
-static esp_err_t blit_dirty_area(const lv_area_t *area,
-                                 uint32_t *dirty_pixels,
-                                 uint32_t *packed_bytes,
-                                 uint32_t *pack_time_us,
-                                 uint32_t *lcd_chunk_count,
-                                 uint32_t *lcd_wait_us)
-{
-    lv_area_t fragments[APP_FACE_MAX_BLIT_FRAGMENTS];
-    size_t count = subtract_protected_areas(area, fragments, APP_FACE_MAX_BLIT_FRAGMENTS);
-    esp_err_t final_err = ESP_OK;
-    for (size_t i = 0; i < count; i++) {
-        lv_area_t fragment = fragments[i];
-        if (!area_clip_to_bounds(&fragment, s_face.canvas.width, s_face.canvas.height)) {
-            continue;
-        }
-        if (dirty_pixels) {
-            *dirty_pixels += area_pixel_count(&fragment);
-        }
-        esp_err_t err = blit_area_from_framebuffer(&fragment, packed_bytes, pack_time_us, lcd_chunk_count, lcd_wait_us);
-        if (err != ESP_OK) {
-            final_err = err;
-        }
-    }
-    return final_err;
 }
 
 static void update_stats(uint32_t now_ms,
@@ -1585,7 +1267,8 @@ static void update_runtime(uint32_t now_ms)
     }
 #endif
 
-    s_face.energy += (s_face.target_energy - s_face.energy) * (1.0f - powf(0.001f, seconds));
+    const app_face_motion_config_t *motion = &APP_FACE_DEFAULT_CONFIG.motion;
+    s_face.energy += (s_face.target_energy - s_face.energy) * follow_response(motion->energy_response_hz, seconds);
     app_face_energy_profile_t energy = energy_profile();
 
     if (s_face.pulse_active && elapsed_ms(now_ms, s_face.pulse_until_ms) < 0x80000000u) {
@@ -1598,14 +1281,14 @@ static void update_runtime(uint32_t now_ms)
     }
     if (s_face.blink.forced) {
         float sleepy = s_face.target_mode == APP_FACE_SLEEPY ? 1.45f : 1.0f;
-        float close_ms = energy.blink_duration_ms * APP_FACE_DEFAULT_CONFIG.motion.blink_close * sleepy;
-        float hold_ms = energy.blink_duration_ms * APP_FACE_DEFAULT_CONFIG.motion.blink_hold * sleepy;
-        float open_ms = energy.blink_duration_ms * APP_FACE_DEFAULT_CONFIG.motion.blink_open * sleepy;
+        float close_ms = energy.blink_duration_ms * motion->blink_close * sleepy;
+        float hold_ms = energy.blink_duration_ms * motion->blink_hold * sleepy;
+        float open_ms = energy.blink_duration_ms * motion->blink_open * sleepy;
         float t = (float)elapsed_ms(now_ms, s_face.blink.start_ms);
         if (t < close_ms) {
             s_face.blink.value = 1.0f - app_face_smoothf(t / close_ms);
         } else if (t < close_ms + hold_ms) {
-            s_face.blink.value = APP_FACE_DEFAULT_CONFIG.motion.blink_minimum_open;
+            s_face.blink.value = motion->blink_minimum_open;
         } else if (t < close_ms + hold_ms + open_ms) {
             s_face.blink.value = app_face_smoothf((t - close_ms - hold_ms) / open_ms);
         } else {
@@ -1613,7 +1296,7 @@ static void update_runtime(uint32_t now_ms)
             s_face.blink.forced = false;
             float nervous = s_face.target_mode == APP_FACE_ERROR ? 0.56f : 1.0f;
             s_face.blink.next_ms = now_ms + (uint32_t)(energy.blink_interval_ms * nervous +
-                                                       rng_float() * energy.blink_interval_ms * APP_FACE_DEFAULT_CONFIG.motion.blink_randomness);
+                                                       rng_float() * energy.blink_interval_ms * motion->blink_randomness);
         }
     }
 
@@ -1623,9 +1306,9 @@ static void update_runtime(uint32_t now_ms)
     } else if (s_face.target_mode == APP_FACE_SLEEPY) {
         squint_target = 0.10f;
     }
-    s_face.micro_squint += (squint_target - s_face.micro_squint) * (1.0f - powf(0.008f, seconds));
+    s_face.micro_squint += (squint_target - s_face.micro_squint) * follow_response(motion->squint_response_hz, seconds);
     if (s_face.click_pulse > 0.0f) {
-        s_face.click_pulse = fmaxf(0.0f, s_face.click_pulse - (float)dt_ms / (float)APP_FACE_DEFAULT_CONFIG.motion.click_pulse_ms);
+        s_face.click_pulse = fmaxf(0.0f, s_face.click_pulse - (float)dt_ms / (float)motion->click_pulse_ms);
     }
 }
 
@@ -1665,11 +1348,7 @@ static void render(uint32_t now_ms)
         dirty_list_add_list(&dirty_list, &s_face.prev_dynamic_list, s_face.canvas.width, s_face.canvas.height);
     }
 
-    uint32_t dirty_pixels = 0;
-    uint32_t packed_bytes = 0;
-    uint32_t pack_time_us = 0;
-    uint32_t lcd_chunk_count = 0;
-    uint32_t lcd_wait_us = 0;
+    app_face_blit_stats_t blit_stats = {0};
     uint32_t restore_time_us = 0;
     uint32_t draw_time_us = 0;
     bool blitted = false;
@@ -1704,13 +1383,19 @@ static void render(uint32_t now_ms)
         draw_time_us += (uint32_t)(esp_timer_get_time() - draw_start);
     }
 
+    app_face_blit_context_t blit_ctx = {
+        .framebuffer = s_face.pixels,
+        .framebuffer_width = s_face.canvas.width,
+        .framebuffer_height = s_face.canvas.height,
+        .tx_buffers = s_face.tx_buffers,
+        .tx_index = &s_face.tx_index,
+        .tx_buffer_bytes = APP_FACE_TX_BUFFER_BYTES,
+        .tx_buffer_count = APP_FACE_TX_BUFFER_COUNT,
+        .protected_areas = s_face.protected_areas,
+        .protected_area_count = s_face.protected_area_count,
+    };
     for (size_t i = 0; i < dirty_list.count; i++) {
-        esp_err_t err = blit_dirty_area(&dirty_list.rects[i],
-                                        &dirty_pixels,
-                                        &packed_bytes,
-                                        &pack_time_us,
-                                        &lcd_chunk_count,
-                                        &lcd_wait_us);
+        esp_err_t err = app_face_blit_dirty_area(&blit_ctx, &dirty_list.rects[i], &blit_stats);
         if (err == ESP_OK) {
             blitted = true;
         } else {
@@ -1727,12 +1412,12 @@ static void render(uint32_t now_ms)
                  render_time_us,
                  restore_time_us,
                  draw_time_us,
-                 pack_time_us,
-                 dirty_pixels,
+                 blit_stats.pack_time_us,
+                 blit_stats.dirty_pixels,
                  (uint32_t)dirty_list.count,
-                 lcd_chunk_count,
-                 packed_bytes,
-                 lcd_wait_us,
+                 blit_stats.lcd_chunk_count,
+                 blit_stats.packed_bytes,
+                 blit_stats.lcd_wait_time_us,
                  full_refresh,
                  blitted);
 }
@@ -1747,6 +1432,9 @@ esp_err_t app_face_init(lv_obj_t *parent)
     s_face.target_mode = APP_FACE_IDLE;
     s_face.base_mode = APP_FACE_IDLE;
     s_face.pulse_return_mode = APP_FACE_IDLE;
+    s_face.transition_from_mood = APP_FACE_MODE_STYLES[APP_FACE_IDLE].v;
+    s_face.transition_from_iris = APP_FACE_MODE_STYLES[APP_FACE_IDLE].iris;
+    s_face.transition_from_pupil = APP_FACE_MODE_STYLES[APP_FACE_IDLE].pupil;
     s_face.energy = 0.21f;
     s_face.target_energy = 0.21f;
     s_face.blink.value = 1.0f;

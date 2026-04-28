@@ -115,6 +115,8 @@ typedef struct {
     float blink_randomness;
     float nod_frequency_base;
     float nod_frequency_energy;
+    float energy_response_hz;
+    float squint_response_hz;
     uint32_t click_pulse_ms;
 } app_face_motion_config_t;
 

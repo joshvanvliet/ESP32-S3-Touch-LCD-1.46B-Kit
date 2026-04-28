@@ -4,11 +4,12 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
-#include "freertos/task.h"
 
 #include "PWR_Key.h"
 #include "app_audio_capture.h"
 #include "app_audio_downlink.h"
+#include "app_audio_profile.h"
+#include "app_audio_uplink.h"
 #include "app_ble_link.h"
 #include "app_protocol.h"
 #include "app_ui.h"
@@ -71,11 +72,8 @@ typedef struct {
 
 static const char *TAG = "APP_STATE";
 static QueueHandle_t s_event_queue;
-static QueueHandle_t s_audio_tx_queue;
-static TaskHandle_t s_audio_tx_task;
 static app_runtime_t s_rt;
 static portMUX_TYPE s_level_lock = portMUX_INITIALIZER_UNLOCKED;
-static portMUX_TYPE s_audio_tx_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint16_t s_latest_level;
 static bool s_latest_level_pending;
 static int64_t s_last_level_ui_us;
@@ -84,8 +82,6 @@ static int64_t s_last_downlink_ready_us;
 static int64_t s_wake_resume_after_us;
 static uint8_t s_active_capture_codec = APP_AUDIO_CODEC_IMA_ADPCM_16K;
 static uint32_t s_active_capture_sample_rate_hz = APP_AUDIO_SAMPLE_RATE_16K;
-static uint8_t s_audio_profile_index;
-static uint8_t s_healthy_session_streak;
 static int64_t s_capture_wall_start_us;
 static int64_t s_uploading_state_enter_us;
 static bool s_agent_activity_busy;
@@ -104,15 +100,8 @@ static void app_state_log_internal_heap(const char *label)
 
 #define APP_LEVEL_NOTIFY_INTERVAL_US 50000
 #define APP_DOWNLINK_READY_NOTIFY_INTERVAL_US 40000
-#define APP_AUDIO_TX_QUEUE_LEN 128
-#define APP_AUDIO_TX_TASK_STACK_SIZE 4096
-#define APP_AUDIO_TX_TASK_PRIORITY 5
-#define APP_AUDIO_TX_TASK_CORE 0
-#define APP_AUDIO_TX_OVERFLOW_STOP_COUNT 3
 #define APP_AUDIO_TX_DRAIN_TIMEOUT_MS 4000
-#define APP_AUDIO_PROFILE_RECOVERY_SESSIONS 3
 #define APP_TRANSCRIPT_WAIT_TIMEOUT_MS 25000
-#define APP_PKT_FLAG_END 0x02
 #define APP_AGENT_ACTIVITY_IDLE 0
 #define APP_AGENT_ACTIVITY_THINKING 1
 #define APP_AGENT_ACTIVITY_SPEAKING 2
@@ -122,43 +111,6 @@ static void app_state_log_internal_heap(const char *label)
 static void app_state_wake_pause(const char *status);
 static void app_state_schedule_wake_rearm(uint32_t delay_ms);
 #endif
-
-typedef struct {
-    uint16_t session_id;
-    uint16_t seq;
-    uint16_t capture_elapsed_ms;
-    uint8_t codec;
-    uint8_t flags;
-    uint16_t payload_len;
-    uint32_t enqueued_at_ms;
-    uint8_t payload[APP_AUDIO_MAX_ADPCM_BYTES];
-} app_audio_tx_item_t;
-
-typedef struct {
-    uint16_t session_id;
-    uint32_t frames_enqueued;
-    uint32_t queue_overflows;
-    uint32_t queue_high_watermark;
-    uint32_t pending_packets;
-    uint32_t tx_queue_delay_max_ms;
-    uint32_t tx_queue_delay_avg_ms;
-    bool end_sent;
-    bool overflow_stop_requested;
-} app_audio_tx_runtime_stats_t;
-
-typedef struct {
-    uint8_t codec;
-    uint32_t sample_rate_hz;
-    const char *label;
-} app_audio_profile_t;
-
-static app_audio_tx_runtime_stats_t s_audio_tx_stats;
-
-static const app_audio_profile_t s_audio_profiles[] = {
-    {.codec = APP_AUDIO_CODEC_IMA_ADPCM_16K, .sample_rate_hz = APP_AUDIO_SAMPLE_RATE_16K, .label = "16k"},
-    {.codec = APP_AUDIO_CODEC_IMA_ADPCM_12K, .sample_rate_hz = APP_AUDIO_SAMPLE_RATE_12K, .label = "12k"},
-    {.codec = APP_AUDIO_CODEC_IMA_ADPCM_8K, .sample_rate_hz = APP_AUDIO_SAMPLE_RATE_8K, .label = "8k"},
-};
 
 static void app_state_set_state(app_device_state_t new_state)
 {
@@ -280,158 +232,17 @@ static void app_state_on_wakeword_detected(void)
 }
 #endif
 
-static const app_audio_profile_t *app_state_active_profile(void)
-{
-    return &s_audio_profiles[s_audio_profile_index];
-}
-
-static void app_state_reset_audio_tx_stats(uint16_t session_id)
-{
-    portENTER_CRITICAL(&s_audio_tx_lock);
-    memset(&s_audio_tx_stats, 0, sizeof(s_audio_tx_stats));
-    s_audio_tx_stats.session_id = session_id;
-    portEXIT_CRITICAL(&s_audio_tx_lock);
-}
-
-static void app_state_snapshot_audio_tx_stats(app_audio_tx_runtime_stats_t *out)
-{
-    if (!out) {
-        return;
-    }
-    portENTER_CRITICAL(&s_audio_tx_lock);
-    *out = s_audio_tx_stats;
-    portEXIT_CRITICAL(&s_audio_tx_lock);
-}
-
-static void app_state_clear_audio_tx_queue(void)
-{
-    if (s_audio_tx_queue) {
-        xQueueReset(s_audio_tx_queue);
-    }
-    app_state_reset_audio_tx_stats(0);
-}
-
-static void app_state_audio_tx_task(void *arg)
-{
-    (void)arg;
-    app_audio_tx_item_t item;
-    uint64_t tx_queue_delay_total_ms = 0;
-    uint32_t tx_queue_delay_count = 0;
-    uint16_t delay_stats_session_id = 0;
-    while (true) {
-        if (xQueueReceive(s_audio_tx_queue, &item, portMAX_DELAY) != pdTRUE) {
-            continue;
-        }
-
-        int64_t now_us = esp_timer_get_time();
-        uint32_t now_ms = (uint32_t)(now_us / 1000);
-        uint32_t queue_delay_ms = (item.enqueued_at_ms <= now_ms) ? (now_ms - item.enqueued_at_ms) : 0;
-
-        app_ble_link_send_audio_packet(item.session_id,
-                                       item.seq,
-                                       item.capture_elapsed_ms,
-                                       item.codec,
-                                       item.flags,
-                                       item.payload_len > 0 ? item.payload : NULL,
-                                       item.payload_len);
-
-        portENTER_CRITICAL(&s_audio_tx_lock);
-        if (s_audio_tx_stats.session_id == item.session_id) {
-            if (s_audio_tx_stats.pending_packets > 0) {
-                s_audio_tx_stats.pending_packets--;
-            }
-            if (delay_stats_session_id != item.session_id) {
-                delay_stats_session_id = item.session_id;
-                tx_queue_delay_total_ms = 0;
-                tx_queue_delay_count = 0;
-            }
-            tx_queue_delay_total_ms += queue_delay_ms;
-            tx_queue_delay_count++;
-            if (queue_delay_ms > s_audio_tx_stats.tx_queue_delay_max_ms) {
-                s_audio_tx_stats.tx_queue_delay_max_ms = queue_delay_ms;
-            }
-            s_audio_tx_stats.tx_queue_delay_avg_ms = (uint32_t)(tx_queue_delay_total_ms / tx_queue_delay_count);
-            if (item.flags & APP_PKT_FLAG_END) {
-                s_audio_tx_stats.end_sent = true;
-            }
-        }
-        portEXIT_CRITICAL(&s_audio_tx_lock);
-
-        if (queue_delay_ms >= 120) {
-            uint32_t capture_age_ms = 0;
-            if (s_capture_wall_start_us > 0 && now_us > s_capture_wall_start_us) {
-                capture_age_ms = (uint32_t)((now_us - s_capture_wall_start_us) / 1000);
-            }
-            ESP_LOGW(TAG,
-                     "Audio TX queue delay session=%u seq=%u queue_delay_ms=%lu cap_ms=%u tx_elapsed_ms=%lu",
-                     item.session_id,
-                     item.seq,
-                     (unsigned long)queue_delay_ms,
-                     (unsigned)item.capture_elapsed_ms,
-                     (unsigned long)capture_age_ms);
-        }
-    }
-}
-
-static bool app_state_wait_for_audio_tx_drain(uint16_t session_id, uint32_t timeout_ms)
-{
-    int64_t start_us = esp_timer_get_time();
-    while (true) {
-        bool drained;
-        portENTER_CRITICAL(&s_audio_tx_lock);
-        if (s_audio_tx_stats.session_id != session_id) {
-            drained = true;
-        } else {
-            drained = s_audio_tx_stats.pending_packets == 0 &&
-                      s_audio_tx_stats.end_sent;
-        }
-        portEXIT_CRITICAL(&s_audio_tx_lock);
-        if (drained) {
-            return true;
-        }
-        if (((esp_timer_get_time() - start_us) / 1000) >= timeout_ms) {
-            return false;
-        }
-        vTaskDelay(1);
-    }
-}
-
-static void app_state_note_session_quality(app_capture_stop_reason_t reason)
-{
-    bool changed = false;
-    if (reason == APP_STOP_REASON_LINK_SLOW) {
-        s_healthy_session_streak = 0;
-        if ((s_audio_profile_index + 1U) < (sizeof(s_audio_profiles) / sizeof(s_audio_profiles[0]))) {
-            s_audio_profile_index++;
-            changed = true;
-        }
-    } else if (reason == APP_STOP_REASON_SILENCE || reason == APP_STOP_REASON_MANUAL || reason == APP_STOP_REASON_MAX_LEN) {
-        if (s_audio_profile_index > 0) {
-            s_healthy_session_streak++;
-            if (s_healthy_session_streak >= APP_AUDIO_PROFILE_RECOVERY_SESSIONS) {
-                s_audio_profile_index--;
-                s_healthy_session_streak = 0;
-                changed = true;
-            }
-        }
-    } else {
-        s_healthy_session_streak = 0;
-    }
-
-    if (changed) {
-        const app_audio_profile_t *profile = app_state_active_profile();
-        ESP_LOGI(TAG,
-                 "Audio profile adjusted for next session: codec=0x%02X sample_rate=%lu profile=%s",
-                 profile->codec,
-                 (unsigned long)profile->sample_rate_hz,
-                 profile->label);
-    }
-}
-
 static void app_state_on_primary_action(void)
 {
     app_event_t ev = {.type = APP_EVENT_PRIMARY_ACTION};
     app_state_post(ev);
+}
+
+static void app_state_on_audio_uplink_slow(uint16_t session_id, uint32_t overflow_count)
+{
+    (void)session_id;
+    (void)overflow_count;
+    app_audio_capture_request_stop(APP_STOP_REASON_LINK_SLOW);
 }
 
 static void app_state_on_pwr_short_press(void)
@@ -583,69 +394,13 @@ static void app_state_on_audio_packet(uint16_t session_id,
                                       const uint8_t *payload,
                                       uint16_t payload_len)
 {
-    if (!s_audio_tx_queue) {
-        return;
-    }
-
-    app_audio_tx_item_t item;
-    memset(&item, 0, sizeof(item));
-    item.session_id = session_id;
-    item.seq = seq;
-    if (capture_elapsed_ms > UINT16_MAX) {
-        item.capture_elapsed_ms = UINT16_MAX;
-    } else {
-        item.capture_elapsed_ms = (uint16_t)capture_elapsed_ms;
-    }
-    item.codec = s_active_capture_codec;
-    item.flags = flags;
-    item.enqueued_at_ms = (uint32_t)(esp_timer_get_time() / 1000);
-    if (payload_len > APP_AUDIO_MAX_ADPCM_BYTES) {
-        payload_len = APP_AUDIO_MAX_ADPCM_BYTES;
-    }
-    item.payload_len = payload_len;
-    if (payload_len > 0 && payload) {
-        memcpy(item.payload, payload, payload_len);
-    }
-
-    TickType_t send_timeout = (flags & APP_PKT_FLAG_END) ? pdMS_TO_TICKS(50) : 0;
-    if (xQueueSend(s_audio_tx_queue, &item, send_timeout) != pdTRUE) {
-        bool request_link_slow_stop = false;
-        uint32_t overflow_count = 0;
-        portENTER_CRITICAL(&s_audio_tx_lock);
-        if (s_audio_tx_stats.session_id == session_id) {
-            s_audio_tx_stats.queue_overflows++;
-            overflow_count = s_audio_tx_stats.queue_overflows;
-            if (payload_len > 0 &&
-                !s_audio_tx_stats.overflow_stop_requested &&
-                s_audio_tx_stats.queue_overflows >= APP_AUDIO_TX_OVERFLOW_STOP_COUNT) {
-                s_audio_tx_stats.overflow_stop_requested = true;
-                request_link_slow_stop = true;
-            }
-        }
-        portEXIT_CRITICAL(&s_audio_tx_lock);
-
-        if (request_link_slow_stop) {
-            ESP_LOGW(TAG,
-                     "Audio TX queue overflow: session=%u overflows=%lu -> stopping capture as LINK_SLOW",
-                     session_id,
-                     (unsigned long)overflow_count);
-            app_audio_capture_request_stop(APP_STOP_REASON_LINK_SLOW);
-        }
-        return;
-    }
-
-    UBaseType_t depth = uxQueueMessagesWaiting(s_audio_tx_queue);
-    portENTER_CRITICAL(&s_audio_tx_lock);
-    if (s_audio_tx_stats.session_id == session_id) {
-        s_audio_tx_stats.pending_packets++;
-        if (payload_len > 0) {
-            s_audio_tx_stats.frames_enqueued++;
-        }
-        if ((uint32_t)depth > s_audio_tx_stats.queue_high_watermark) {
-            s_audio_tx_stats.queue_high_watermark = (uint32_t)depth;
-        }
-    }
-    portEXIT_CRITICAL(&s_audio_tx_lock);
+    (void)app_audio_uplink_enqueue(session_id,
+                                   seq,
+                                   capture_elapsed_ms,
+                                   s_active_capture_codec,
+                                   flags,
+                                   payload,
+                                   payload_len);
 }
 
 static void app_state_on_audio_stopped(uint16_t session_id, app_capture_stop_reason_t reason, const app_audio_capture_stats_t *stats)
@@ -697,23 +452,23 @@ static void app_state_start_capture(void)
     }
 #endif
 
-    const app_audio_profile_t *profile = app_state_active_profile();
+    const app_audio_profile_t *profile = app_audio_profile_active();
 
     s_rt.current_session_id++;
     if (s_rt.current_session_id == 0) {
         s_rt.current_session_id = 1;
     }
 
-    app_state_clear_audio_tx_queue();
-    app_state_reset_audio_tx_stats(s_rt.current_session_id);
     app_ble_link_begin_audio_session(s_rt.current_session_id);
     s_active_capture_codec = profile->codec;
     s_active_capture_sample_rate_hz = profile->sample_rate_hz;
 
     s_capture_wall_start_us = esp_timer_get_time();
+    app_audio_uplink_start_session(s_rt.current_session_id, s_capture_wall_start_us);
     bool ok = app_audio_capture_start(s_rt.current_session_id, profile->codec, profile->sample_rate_hz);
     if (!ok) {
         s_capture_wall_start_us = 0;
+        app_audio_uplink_clear();
         app_ui_set_status_text("Capture start failed");
         app_ble_link_notify_error(1);
         return;
@@ -799,7 +554,7 @@ static void app_state_handle_event(const app_event_t *ev)
             }
             s_capture_wall_start_us = 0;
             app_audio_downlink_reset();
-            app_state_clear_audio_tx_queue();
+            app_audio_uplink_clear();
             portENTER_CRITICAL(&s_level_lock);
             s_latest_level = 0;
             s_latest_level_pending = false;
@@ -837,11 +592,11 @@ static void app_state_handle_event(const app_event_t *ev)
             app_audio_capture_stats_t capture_stats = ev->data.capture.stats;
             s_capture_wall_start_us = 0;
 
-            bool drained = app_state_wait_for_audio_tx_drain(ev->data.capture.session_id, APP_AUDIO_TX_DRAIN_TIMEOUT_MS);
+            bool drained = app_audio_uplink_wait_for_drain(ev->data.capture.session_id, APP_AUDIO_TX_DRAIN_TIMEOUT_MS);
             if (!drained) {
-                app_audio_tx_runtime_stats_t tx_pending;
+                app_audio_uplink_stats_t tx_pending;
                 memset(&tx_pending, 0, sizeof(tx_pending));
-                app_state_snapshot_audio_tx_stats(&tx_pending);
+                app_audio_uplink_snapshot_stats(&tx_pending);
                 ESP_LOGW(TAG,
                          "Audio TX drain timeout: session=%u pending=%lu end_sent=%d",
                          ev->data.capture.session_id,
@@ -849,9 +604,9 @@ static void app_state_handle_event(const app_event_t *ev)
                          tx_pending.end_sent ? 1 : 0);
             }
 
-            app_audio_tx_runtime_stats_t tx_runtime;
+            app_audio_uplink_stats_t tx_runtime;
             memset(&tx_runtime, 0, sizeof(tx_runtime));
-            app_state_snapshot_audio_tx_stats(&tx_runtime);
+            app_audio_uplink_snapshot_stats(&tx_runtime);
             capture_stats.frames_enqueued = tx_runtime.frames_enqueued;
             capture_stats.queue_overflows = tx_runtime.queue_overflows;
             capture_stats.queue_high_watermark = tx_runtime.queue_high_watermark;
@@ -892,7 +647,7 @@ static void app_state_handle_event(const app_event_t *ev)
             s_latest_level = 0;
             s_latest_level_pending = false;
             portEXIT_CRITICAL(&s_level_lock);
-            app_state_note_session_quality(effective_reason);
+            app_audio_profile_note_session_quality(effective_reason);
             break;
 
         case APP_EVENT_TRANSCRIPT:
@@ -988,32 +743,23 @@ esp_err_t app_state_init(void)
     s_latest_level_pending = false;
     s_last_level_ui_us = 0;
     s_last_level_notify_us = 0;
-    s_audio_profile_index = 0;
-    s_healthy_session_streak = 0;
     s_active_capture_codec = APP_AUDIO_CODEC_IMA_ADPCM_16K;
     s_active_capture_sample_rate_hz = APP_AUDIO_SAMPLE_RATE_16K;
     s_uploading_state_enter_us = 0;
     s_wake_resume_after_us = 0;
     s_agent_activity_busy = false;
     s_wake_ignored_count = 0;
-    memset(&s_audio_tx_stats, 0, sizeof(s_audio_tx_stats));
-
+    app_audio_profile_reset();
     s_event_queue = xQueueCreate(32, sizeof(app_event_t));
     if (!s_event_queue) {
         return ESP_ERR_NO_MEM;
     }
-    s_audio_tx_queue = xQueueCreate(APP_AUDIO_TX_QUEUE_LEN, sizeof(app_audio_tx_item_t));
-    if (!s_audio_tx_queue) {
-        return ESP_ERR_NO_MEM;
-    }
-    BaseType_t tx_ok = xTaskCreatePinnedToCore(app_state_audio_tx_task,
-                                               "app_audio_tx",
-                                               APP_AUDIO_TX_TASK_STACK_SIZE,
-                                               NULL,
-                                               APP_AUDIO_TX_TASK_PRIORITY,
-                                               &s_audio_tx_task,
-                                               APP_AUDIO_TX_TASK_CORE);
-    if (tx_ok != pdPASS) {
+
+    app_audio_uplink_callbacks_t uplink_callbacks = {
+        .on_link_slow = app_state_on_audio_uplink_slow,
+    };
+    esp_err_t init_err = app_audio_uplink_init(&uplink_callbacks);
+    if (init_err != ESP_OK) {
         return ESP_ERR_NO_MEM;
     }
 
@@ -1039,7 +785,7 @@ esp_err_t app_state_init(void)
         .on_audio_downlink_packet = app_state_on_ble_audio_downlink_packet,
     };
 
-    esp_err_t init_err = app_ble_link_init(&ble_callbacks);
+    init_err = app_ble_link_init(&ble_callbacks);
     app_state_log_internal_heap("After BLE init");
     if (init_err != ESP_OK) {
         ESP_LOGE(TAG, "BLE init failed: %s", esp_err_to_name(init_err));
