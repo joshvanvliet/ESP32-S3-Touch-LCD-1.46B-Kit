@@ -28,4 +28,40 @@ menu "Example Configuration"
         default 1200
         depends on APP_WAKEWORD_ENABLED
 
+    config APP_FACE_ENABLED
+        bool "Enable animated assistant face"
+        default y
+
+    config APP_FACE_FPS
+        int "Animated assistant face frame rate"
+        range 10 60
+        default 60
+        depends on APP_FACE_ENABLED
+
+    config APP_FACE_TX_BUFFER_BYTES
+        int "Animated face LCD transfer buffer bytes"
+        range 4096 32768
+        default 8192
+        depends on APP_FACE_ENABLED
+
+    config APP_FACE_USE_IMU
+        bool "Drive animated assistant face from QMI8658 tilt"
+        default y
+        depends on APP_FACE_ENABLED
+
+    config APP_FACE_TOUCH_START_ENABLED
+        bool "Use screen taps as primary assistant action"
+        default y
+        depends on APP_FACE_ENABLED
+
+    config APP_FACE_DEBUG_OVERLAY
+        bool "Show animated face debug overlay"
+        default n
+        depends on APP_FACE_ENABLED
+
+    config APP_FACE_PROFILE
+        bool "Log animated face renderer performance counters"
+        default n
+        depends on APP_FACE_ENABLED
+
 endmenu

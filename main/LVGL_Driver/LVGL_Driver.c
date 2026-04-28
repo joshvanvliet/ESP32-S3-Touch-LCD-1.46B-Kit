@@ -1,5 +1,7 @@
 #include "LVGL_Driver.h"
 
+#include "app_lcd.h"
+
 static const char *TAG_LVGL = "LVGL";
 
     
@@ -25,16 +27,28 @@ void Lvgl_port_rounder_callback(struct _lv_disp_drv_t * disp_drv, lv_area_t * ar
   area->x2 = ((x2 >> 2) << 2) + 3;
 }
 
+static bool lvgl_flush_done(void *user)
+{
+    lv_disp_flush_ready((lv_disp_drv_t *)user);
+    return false;
+}
+
 void example_lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map)
 {
-    esp_lcd_panel_handle_t panel_handle = (esp_lcd_panel_handle_t) drv->user_data;
     int offsetx1 = area->x1;
     int offsetx2 = area->x2;
     int offsety1 = area->y1;
     int offsety2 = area->y2;
-    // copy a buffer's content to a specific area of the display
-    esp_lcd_panel_draw_bitmap(panel_handle, offsetx1, offsety1, offsetx2 +1, offsety2 + 1, color_map);
-    lv_disp_flush_ready(drv);
+    esp_err_t err = app_lcd_blit_rect_async(offsetx1,
+                                            offsety1,
+                                            offsetx2 - offsetx1 + 1,
+                                            offsety2 - offsety1 + 1,
+                                            color_map,
+                                            lvgl_flush_done,
+                                            drv);
+    if (err != ESP_OK) {
+        lv_disp_flush_ready(drv);
+    }
 }
 
 /*Read the touchpad*/

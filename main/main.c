@@ -7,7 +7,9 @@
 #include "PWR_Key.h"
 #include "PCM5101.h"
 #include "LVGL_Driver.h"
+#include "app_motion.h"
 #include "app_state.h"
+#include "app_ui.h"
 
 #include "esp_log.h"
 #include "nvs_flash.h"
@@ -21,11 +23,12 @@ static void driver_loop(void *parameter)
 
     while (1) {
         PWR_Loop();
+        QMI8658_Loop();
+        app_motion_update_from_accel(Accel.x, Accel.y, Accel.z);
 
         slow_div++;
         if (slow_div >= 5) {
             slow_div = 0;
-            QMI8658_Loop();
             PCF85063_Loop();
             BAT_Get_Volts();
         }
@@ -79,9 +82,12 @@ void app_main(void)
 
     ESP_ERROR_CHECK(app_state_init());
 
+    TickType_t last_wake = xTaskGetTickCount();
+    const TickType_t service_cadence = pdMS_TO_TICKS(1) > 0 ? pdMS_TO_TICKS(1) : 1;
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(10));
-        lv_timer_handler();
+        vTaskDelayUntil(&last_wake, service_cadence);
         app_state_process();
+        app_ui_process();
+        lv_timer_handler();
     }
 }

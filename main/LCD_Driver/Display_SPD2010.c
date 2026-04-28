@@ -1,5 +1,7 @@
 #include "Display_SPD2010.h"
 
+#include "app_lcd.h"
+
 static const char *TAG_LCD = "SPD2010";
 
 esp_lcd_panel_handle_t panel_handle = NULL;
@@ -61,7 +63,7 @@ int QSPI_Init(void){
     .spi_mode = ESP_PANEL_LCD_SPI_MODE,                      
     .pclk_hz = ESP_PANEL_LCD_SPI_CLK_HZ,     
     .trans_queue_depth = ESP_PANEL_LCD_SPI_TRANS_QUEUE_SZ,            
-    .on_color_trans_done = NULL,                            
+    .on_color_trans_done = app_lcd_color_trans_done,
     .user_ctx = NULL,                   
     .lcd_cmd_bits = ESP_PANEL_LCD_SPI_CMD_BITS,                 
     .lcd_param_bits = ESP_PANEL_LCD_SPI_PARAM_BITS,                
@@ -98,6 +100,7 @@ int QSPI_Init(void){
     .vendor_config = (void *) &vendor_config,                                  
   };
   esp_lcd_new_panel_spd2010(io_handle, &panel_config, &panel_handle);
+  app_lcd_init(panel_handle);
 
   esp_lcd_panel_reset(panel_handle);
   esp_lcd_panel_init(panel_handle);

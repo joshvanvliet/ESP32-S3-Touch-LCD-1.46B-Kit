@@ -15,6 +15,7 @@
 #if CONFIG_APP_WAKEWORD_ENABLED
 #include "app_wakeword.h"
 #endif
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 
@@ -89,6 +90,17 @@ static int64_t s_capture_wall_start_us;
 static int64_t s_uploading_state_enter_us;
 static bool s_agent_activity_busy;
 static uint32_t s_wake_ignored_count;
+
+static void app_state_log_internal_heap(const char *label)
+{
+    ESP_LOGI(TAG,
+             "%s heap internal_free=%lu internal_largest=%lu psram_free=%lu psram_largest=%lu",
+             label,
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+             (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+}
 
 #define APP_LEVEL_NOTIFY_INTERVAL_US 50000
 #define APP_DOWNLINK_READY_NOTIFY_INTERVAL_US 40000
@@ -546,6 +558,7 @@ static void app_state_on_ble_audio_downlink_packet(uint16_t session_id,
     }
     if (flags & 0x01) {
         app_ble_link_notify_agent_status(2, "Speaking...");
+        app_ui_set_agent_activity(APP_AGENT_ACTIVITY_SPEAKING);
     }
     app_ble_link_notify_audio_downlink_ready(app_audio_downlink_available_credits());
 }
@@ -889,6 +902,7 @@ static void app_state_handle_event(const app_event_t *ev)
             break;
 
         case APP_EVENT_AGENT_ACTIVITY:
+            app_ui_set_agent_activity(ev->data.agent_activity.status);
 #if CONFIG_APP_WAKEWORD_ENABLED
             if (ev->data.agent_activity.status == APP_AGENT_ACTIVITY_THINKING ||
                 ev->data.agent_activity.status == APP_AGENT_ACTIVITY_SPEAKING) {
@@ -1003,6 +1017,7 @@ esp_err_t app_state_init(void)
     app_ui_init(&ui_callbacks);
     app_ui_set_state(APP_STATE_UNPAIRED);
     app_ui_set_status_text("Starting BLE...");
+    app_state_log_internal_heap("Before BLE init");
 
     app_ble_callbacks_t ble_callbacks = {
         .on_pairing_started = app_state_on_ble_pairing_started,
@@ -1018,21 +1033,44 @@ esp_err_t app_state_init(void)
         .on_audio_downlink_packet = app_state_on_ble_audio_downlink_packet,
     };
 
-    ESP_ERROR_CHECK(app_ble_link_init(&ble_callbacks));
-    app_ui_set_status_text("Open Android app and connect");
+    esp_err_t init_err = app_ble_link_init(&ble_callbacks);
+    app_state_log_internal_heap("After BLE init");
+    if (init_err != ESP_OK) {
+        ESP_LOGE(TAG, "BLE init failed: %s", esp_err_to_name(init_err));
+        app_ui_set_status_text("BLE init failed");
+        app_ui_set_agent_activity(APP_AGENT_ACTIVITY_ERROR);
+    } else {
+        app_ui_set_status_text("Open Android app and connect");
+    }
 
     app_audio_capture_callbacks_t audio_callbacks = {
         .on_level = app_state_on_audio_level,
         .on_packet = app_state_on_audio_packet,
         .on_stopped = app_state_on_audio_stopped,
     };
-    ESP_ERROR_CHECK(app_audio_capture_init(&audio_callbacks));
-    ESP_ERROR_CHECK(app_audio_downlink_init(app_state_on_audio_downlink_done));
+    init_err = app_audio_capture_init(&audio_callbacks);
+    if (init_err != ESP_OK) {
+        ESP_LOGE(TAG, "Audio capture init failed: %s", esp_err_to_name(init_err));
+        app_ui_set_status_text("Mic init failed");
+        app_ui_set_agent_activity(APP_AGENT_ACTIVITY_ERROR);
+    }
+    init_err = app_audio_downlink_init(app_state_on_audio_downlink_done);
+    app_state_log_internal_heap("After audio init");
+    if (init_err != ESP_OK) {
+        ESP_LOGE(TAG, "Audio downlink init failed: %s", esp_err_to_name(init_err));
+        app_ui_set_status_text("Speaker init failed");
+        app_ui_set_agent_activity(APP_AGENT_ACTIVITY_ERROR);
+    }
 #if CONFIG_APP_WAKEWORD_ENABLED
     app_wakeword_callbacks_t wake_callbacks = {
         .on_detected = app_state_on_wakeword_detected,
     };
-    ESP_ERROR_CHECK(app_wakeword_init(&wake_callbacks));
+    init_err = app_wakeword_init(&wake_callbacks);
+    if (init_err != ESP_OK) {
+        ESP_LOGE(TAG, "Wake word init failed: %s", esp_err_to_name(init_err));
+        app_ui_set_status_text("Wake init failed");
+        app_ui_set_agent_activity(APP_AGENT_ACTIVITY_ERROR);
+    }
 #endif
 
     PWR_RegisterShortPressCallback(app_state_on_pwr_short_press);
