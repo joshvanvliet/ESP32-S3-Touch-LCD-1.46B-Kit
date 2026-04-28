@@ -12,6 +12,9 @@
 #include "app_ble_link.h"
 #include "app_protocol.h"
 #include "app_ui.h"
+#if CONFIG_APP_WAKEWORD_ENABLED
+#include "app_wakeword.h"
+#endif
 #include "esp_log.h"
 #include "esp_timer.h"
 
@@ -30,6 +33,8 @@ typedef enum {
     APP_EVENT_CAPTURE_STOPPED,
     APP_EVENT_TRANSCRIPT,
     APP_EVENT_AUDIO_DOWNLINK_DONE,
+    APP_EVENT_AGENT_ACTIVITY,
+    APP_EVENT_WAKEWORD_DETECTED,
 } app_event_type_t;
 
 typedef struct {
@@ -50,6 +55,9 @@ typedef struct {
             uint16_t session_id;
             uint8_t status;
         } downlink_done;
+        struct {
+            uint8_t status;
+        } agent_activity;
     } data;
 } app_event_t;
 
@@ -72,12 +80,15 @@ static bool s_latest_level_pending;
 static int64_t s_last_level_ui_us;
 static int64_t s_last_level_notify_us;
 static int64_t s_last_downlink_ready_us;
+static int64_t s_wake_resume_after_us;
 static uint8_t s_active_capture_codec = APP_AUDIO_CODEC_IMA_ADPCM_16K;
 static uint32_t s_active_capture_sample_rate_hz = APP_AUDIO_SAMPLE_RATE_16K;
 static uint8_t s_audio_profile_index;
 static uint8_t s_healthy_session_streak;
 static int64_t s_capture_wall_start_us;
 static int64_t s_uploading_state_enter_us;
+static bool s_agent_activity_busy;
+static uint32_t s_wake_ignored_count;
 
 #define APP_LEVEL_NOTIFY_INTERVAL_US 50000
 #define APP_DOWNLINK_READY_NOTIFY_INTERVAL_US 40000
@@ -90,6 +101,15 @@ static int64_t s_uploading_state_enter_us;
 #define APP_AUDIO_PROFILE_RECOVERY_SESSIONS 3
 #define APP_TRANSCRIPT_WAIT_TIMEOUT_MS 25000
 #define APP_PKT_FLAG_END 0x02
+#define APP_AGENT_ACTIVITY_IDLE 0
+#define APP_AGENT_ACTIVITY_THINKING 1
+#define APP_AGENT_ACTIVITY_SPEAKING 2
+#define APP_AGENT_ACTIVITY_ERROR 3
+
+#if CONFIG_APP_WAKEWORD_ENABLED
+static void app_state_wake_pause(const char *status);
+static void app_state_schedule_wake_rearm(uint32_t delay_ms);
+#endif
 
 typedef struct {
     uint16_t session_id;
@@ -147,6 +167,18 @@ static void app_state_set_state(app_device_state_t new_state)
     } else if (new_state == APP_STATE_RESULT) {
         app_ble_link_notify_agent_status(0, "Idle");
     }
+
+#if CONFIG_APP_WAKEWORD_ENABLED
+    if (new_state == APP_STATE_RECORDING ||
+        new_state == APP_STATE_UPLOADING ||
+        new_state == APP_STATE_UNPAIRED ||
+        new_state == APP_STATE_PAIRING ||
+        new_state == APP_STATE_LINKED) {
+        app_state_wake_pause("Wake paused");
+    } else if (new_state == APP_STATE_READY || new_state == APP_STATE_RESULT) {
+        app_state_schedule_wake_rearm(CONFIG_APP_WAKEWORD_RESUME_DELAY_MS);
+    }
+#endif
 }
 
 static bool app_state_post(app_event_t ev)
@@ -156,6 +188,80 @@ static bool app_state_post(app_event_t ev)
     }
     return xQueueSend(s_event_queue, &ev, 0) == pdTRUE;
 }
+
+#if CONFIG_APP_WAKEWORD_ENABLED
+static bool app_state_wake_allowed(void)
+{
+    return app_ble_link_is_connected() &&
+           !s_agent_activity_busy &&
+           !app_audio_capture_is_running() &&
+           !app_audio_downlink_active() &&
+           (s_rt.state == APP_STATE_READY || s_rt.state == APP_STATE_RESULT);
+}
+
+static void app_state_wake_pause(const char *status)
+{
+    s_wake_resume_after_us = 0;
+    if (app_wakeword_is_running()) {
+        if (!app_wakeword_stop(CONFIG_APP_WAKEWORD_STOP_TIMEOUT_MS)) {
+            ESP_LOGW(TAG, "WakeNet stop timed out");
+        }
+    }
+    if (status && status[0] != '\0') {
+        app_ui_set_status_text(status);
+    }
+}
+
+static bool app_state_stop_wake_before_capture(void)
+{
+    if (!app_wakeword_is_running()) {
+        return true;
+    }
+    if (app_wakeword_stop(CONFIG_APP_WAKEWORD_STOP_TIMEOUT_MS)) {
+        return true;
+    }
+    app_ui_set_status_text("Wake busy - try button");
+    app_ble_link_notify_error(3);
+    ESP_LOGW(TAG, "Capture blocked: WakeNet stop timeout");
+    return false;
+}
+
+static void app_state_schedule_wake_rearm(uint32_t delay_ms)
+{
+    if (!app_state_wake_allowed()) {
+        s_wake_resume_after_us = 0;
+        return;
+    }
+    int64_t now_us = esp_timer_get_time();
+    s_wake_resume_after_us = now_us + ((int64_t)delay_ms * 1000);
+    if (delay_ms > 0) {
+        app_ui_set_status_text("Wake paused");
+    }
+}
+
+static void app_state_try_wake_rearm(void)
+{
+    if (s_wake_resume_after_us == 0 || esp_timer_get_time() < s_wake_resume_after_us) {
+        return;
+    }
+    s_wake_resume_after_us = 0;
+    if (!app_state_wake_allowed() || app_wakeword_is_running()) {
+        return;
+    }
+    esp_err_t err = app_wakeword_start();
+    if (err == ESP_OK) {
+        app_ui_set_status_text("Wake listening");
+    } else {
+        ESP_LOGW(TAG, "WakeNet start failed: %s", esp_err_to_name(err));
+    }
+}
+
+static void app_state_on_wakeword_detected(void)
+{
+    app_event_t ev = {.type = APP_EVENT_WAKEWORD_DETECTED};
+    app_state_post(ev);
+}
+#endif
 
 static const app_audio_profile_t *app_state_active_profile(void)
 {
@@ -368,6 +474,15 @@ static void app_state_on_ble_stop_capture(void)
     app_state_post(ev);
 }
 
+static void app_state_on_ble_agent_activity(uint8_t status)
+{
+    app_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = APP_EVENT_AGENT_ACTIVITY;
+    ev.data.agent_activity.status = status;
+    app_state_post(ev);
+}
+
 static void app_state_on_ble_result_text(uint16_t session_id, uint8_t status, const char *text)
 {
     app_event_t ev;
@@ -402,6 +517,12 @@ static void app_state_on_ble_audio_downlink_packet(uint16_t session_id,
                                                    const uint8_t *payload,
                                                    uint16_t payload_len)
 {
+    if (flags & 0x01) {
+#if CONFIG_APP_WAKEWORD_ENABLED
+        s_agent_activity_busy = true;
+        app_state_wake_pause("Wake paused");
+#endif
+    }
     bool ok = app_audio_downlink_enqueue(
         session_id,
         seq,
@@ -551,6 +672,12 @@ static void app_state_start_capture(void)
         ESP_LOGW(TAG, "Capture start blocked: audio notify disabled");
         return;
     }
+
+#if CONFIG_APP_WAKEWORD_ENABLED
+    if (!app_state_stop_wake_before_capture()) {
+        return;
+    }
+#endif
 
     const app_audio_profile_t *profile = app_state_active_profile();
 
@@ -761,7 +888,50 @@ static void app_state_handle_event(const app_event_t *ev)
             app_ui_set_status_text("Transcript mirrored from phone");
             break;
 
+        case APP_EVENT_AGENT_ACTIVITY:
+#if CONFIG_APP_WAKEWORD_ENABLED
+            if (ev->data.agent_activity.status == APP_AGENT_ACTIVITY_THINKING ||
+                ev->data.agent_activity.status == APP_AGENT_ACTIVITY_SPEAKING) {
+                s_agent_activity_busy = true;
+                app_state_wake_pause("Wake paused");
+            } else {
+                s_agent_activity_busy = false;
+                app_state_schedule_wake_rearm(CONFIG_APP_WAKEWORD_RESUME_DELAY_MS);
+            }
+#endif
+            break;
+
+        case APP_EVENT_WAKEWORD_DETECTED:
+#if CONFIG_APP_WAKEWORD_ENABLED
+            ESP_LOGI(TAG, "Wake event received in state=%u busy=%d", (unsigned)s_rt.state, s_agent_activity_busy ? 1 : 0);
+            if (!app_ble_link_audio_notify_ready()) {
+                app_ui_set_status_text("Wake detected - app audio not ready");
+                app_state_schedule_wake_rearm(CONFIG_APP_WAKEWORD_RESUME_DELAY_MS);
+                break;
+            }
+            if (s_rt.state == APP_STATE_RESULT) {
+                app_state_set_state(APP_STATE_READY);
+            }
+            if (s_rt.state != APP_STATE_READY || s_agent_activity_busy || app_audio_downlink_active()) {
+                s_wake_ignored_count++;
+                ESP_LOGW(TAG,
+                         "Wake ignored state=%u busy=%d downlink=%d ignored=%lu",
+                         (unsigned)s_rt.state,
+                         s_agent_activity_busy ? 1 : 0,
+                         app_audio_downlink_active() ? 1 : 0,
+                         (unsigned long)s_wake_ignored_count);
+                app_state_schedule_wake_rearm(CONFIG_APP_WAKEWORD_RESUME_DELAY_MS);
+                break;
+            }
+            app_ui_set_status_text("Wake detected");
+            app_state_start_capture();
+#endif
+            break;
+
         case APP_EVENT_AUDIO_DOWNLINK_DONE:
+#if CONFIG_APP_WAKEWORD_ENABLED
+            s_agent_activity_busy = false;
+#endif
             app_ble_link_notify_audio_downlink_done(ev->data.downlink_done.session_id, ev->data.downlink_done.status);
             if (ev->data.downlink_done.status == 0) {
                 app_ui_set_status_text("Playback complete");
@@ -773,12 +943,15 @@ static void app_state_handle_event(const app_event_t *ev)
                 app_ui_set_status_text("Playback failed (sequence)");
                 app_ble_link_notify_agent_status(3, "Playback sequence mismatch");
             } else if (ev->data.downlink_done.status == 3) {
-                app_ui_set_status_text("Playback failed (i2s)");
-                app_ble_link_notify_agent_status(3, "Playback I2S write failed");
+                app_ui_set_status_text("Playback failed (audio)");
+                app_ble_link_notify_agent_status(3, "Playback audio failed");
             } else {
                 app_ui_set_status_text("Playback failed");
                 app_ble_link_notify_agent_status(3, "Playback error");
             }
+#if CONFIG_APP_WAKEWORD_ENABLED
+            app_state_schedule_wake_rearm(CONFIG_APP_WAKEWORD_RESUME_DELAY_MS);
+#endif
             break;
 
         case APP_EVENT_NONE:
@@ -800,6 +973,9 @@ esp_err_t app_state_init(void)
     s_active_capture_codec = APP_AUDIO_CODEC_IMA_ADPCM_16K;
     s_active_capture_sample_rate_hz = APP_AUDIO_SAMPLE_RATE_16K;
     s_uploading_state_enter_us = 0;
+    s_wake_resume_after_us = 0;
+    s_agent_activity_busy = false;
+    s_wake_ignored_count = 0;
     memset(&s_audio_tx_stats, 0, sizeof(s_audio_tx_stats));
 
     s_event_queue = xQueueCreate(32, sizeof(app_event_t));
@@ -837,6 +1013,7 @@ esp_err_t app_state_init(void)
         .on_pairing_passkey = app_state_on_ble_passkey,
         .on_control_start_capture = app_state_on_ble_start_capture,
         .on_control_stop_capture = app_state_on_ble_stop_capture,
+        .on_control_agent_activity = app_state_on_ble_agent_activity,
         .on_result_text = app_state_on_ble_result_text,
         .on_audio_downlink_packet = app_state_on_ble_audio_downlink_packet,
     };
@@ -851,6 +1028,12 @@ esp_err_t app_state_init(void)
     };
     ESP_ERROR_CHECK(app_audio_capture_init(&audio_callbacks));
     ESP_ERROR_CHECK(app_audio_downlink_init(app_state_on_audio_downlink_done));
+#if CONFIG_APP_WAKEWORD_ENABLED
+    app_wakeword_callbacks_t wake_callbacks = {
+        .on_detected = app_state_on_wakeword_detected,
+    };
+    ESP_ERROR_CHECK(app_wakeword_init(&wake_callbacks));
+#endif
 
     PWR_RegisterShortPressCallback(app_state_on_pwr_short_press);
 
@@ -906,4 +1089,7 @@ void app_state_process(void)
         s_last_downlink_ready_us = 0;
     }
 
+#if CONFIG_APP_WAKEWORD_ENABLED
+    app_state_try_wake_rearm();
+#endif
 }

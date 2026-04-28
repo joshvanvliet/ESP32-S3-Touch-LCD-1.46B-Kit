@@ -15,6 +15,7 @@ typedef struct {
     void (*on_pairing_passkey)(uint32_t passkey);
     void (*on_control_start_capture)(void);
     void (*on_control_stop_capture)(void);
+    void (*on_control_agent_activity)(uint8_t status);
     void (*on_result_text)(uint16_t session_id, uint8_t status, const char *text);
     void (*on_audio_downlink_packet)(uint16_t session_id,
                                      uint16_t seq,

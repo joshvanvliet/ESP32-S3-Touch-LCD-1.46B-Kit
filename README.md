@@ -1,16 +1,20 @@
-# Waveshare ESP32-S3 Touch 1.46 Starter
+# ESP Assistant Firmware
 
-A standalone ESP-IDF starter project for the Waveshare ESP32-S3 Touch 1.46 board.
+ESP-IDF firmware for the Waveshare ESP32-S3 Touch 1.46 board used by the ESP
+Assistant Android companion.
 
-This project is intended as a hardware bring-up baseline you can zip and publish as a separate repo.
-It initializes and demonstrates:
+The current app firmware provides:
 
 - Display + touch (LVGL UI)
 - Battery ADC measurement
 - RTC (PCF85063)
 - IMU (QMI8658)
-- Speaker output (startup chirp + beep button)
-- Microphone speech front-end (WakeNet + Multinet + live level logs)
+- Secure BLE companion link
+- Microphone capture streamed to Android as IMA ADPCM
+- Transcript/result mirroring from Android
+- Agent audio downlink playback over BLE
+- Opus 24 kHz and legacy ADPCM downlink decoding
+- WakeNet-triggered assistant capture when the Android app is connected
 
 ## Quick Start
 
@@ -26,31 +30,44 @@ idf.py -p COM7 flash monitor
 
 Replace `COM7` with your port.
 
-## What You Should See
+## Wake Word
 
-In serial logs:
+WakeNet is controlled by project Kconfig:
 
-- `App/Speech: I2S mic slot: RIGHT`
-- `App/Speech: Ready`
-- `App/Speech: MIC level avg=... peak=...`
+- `CONFIG_APP_WAKEWORD_ENABLED=y`
+- `CONFIG_APP_WAKEWORD_RESUME_DELAY_MS=800`
+- `CONFIG_APP_WAKEWORD_STOP_TIMEOUT_MS=1200`
 
-On screen:
+When enabled, WakeNet owns the microphone only while the assistant is idle. A
+verified wake event stops WakeNet, starts the existing BLE capture path, and then
+re-arms after Android/backend thinking and speaker playback finish.
 
-- Live battery / RTC / IMU values
-- `Touch Test Button` counter increments when touched
-- `Play Speaker Beep` button emits a short test tone
-- Backlight slider changes panel brightness
+## BLE Audio Downlink
+
+The firmware protocol version is `0x07`. Android can send agent activity control
+packets so the firmware pauses WakeNet while the backend is thinking or the
+speaker is playing. Downlink audio packets keep the existing 14-byte header.
+
+Supported downlink codecs:
+
+- `0x05`: Opus 24 kHz, 20 ms frames, 480 PCM samples per frame
+- `0x04`: IMA ADPCM 24 kHz
+- `0x01`: IMA ADPCM 16 kHz
+- `0x02`: IMA ADPCM 12 kHz
+- `0x03`: IMA ADPCM 8 kHz
 
 ## Project Layout
 
 - `main/main.c`:
   Board bring-up and main loop.
-- `main/starter_ui.c`:
-  Demo UI and peripheral test controls.
-- `main/MIC_Driver/MIC_Speech.c`:
-  Mic pipeline + periodic level logging.
-- `main/Audio_Driver/PCM5101.c`:
-  Speaker init + `Audio_Play_Test_Tone()` helper.
+- `main/app_state.c`:
+  BLE/app state machine, capture lifecycle, wake re-arm policy.
+- `main/app_wakeword.c`:
+  WakeNet-only idle trigger for assistant capture.
+- `main/app_audio_capture.c`:
+  Microphone capture + VAD + ADPCM uplink.
+- `main/app_audio_downlink.c`:
+  Opus/ADPCM downlink decode, buffering, and speaker playback.
 
 ## Make Your Own App
 

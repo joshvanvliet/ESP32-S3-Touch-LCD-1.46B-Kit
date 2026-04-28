@@ -315,6 +315,15 @@ static int app_ble_access_cb(
                 break;
             case APP_CTRL_SET_CONFIG:
                 break;
+            case APP_CTRL_AGENT_ACTIVITY:
+                if (len < 2) {
+                    ESP_LOGW(TAG, "Reject agent activity: missing status");
+                    return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+                }
+                if (s_callbacks.on_control_agent_activity) {
+                    s_callbacks.on_control_agent_activity(buf[1]);
+                }
+                break;
             default:
                 ESP_LOGW(TAG, "Unknown control opcode: 0x%02X", buf[0]);
                 return BLE_ATT_ERR_WRITE_NOT_PERMITTED;

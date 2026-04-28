@@ -8,9 +8,6 @@
 #include "PCM5101.h"
 #include "LVGL_Driver.h"
 #include "app_state.h"
-#if CONFIG_APP_WAKEWORD_ENABLED
-#include "MIC_Speech.h"
-#endif
 
 #include "esp_log.h"
 #include "nvs_flash.h"
@@ -79,12 +76,6 @@ void app_main(void)
     Audio_Play_Test_Tone(1000, 100);
     vTaskDelay(pdMS_TO_TICKS(60));
     Audio_Play_Test_Tone(1400, 100);
-
-#if CONFIG_APP_WAKEWORD_ENABLED
-    // Waveshare notes recommend avoiding concurrent speech recognition while speaker playback runs.
-    // Start wakeword pipeline after startup tone to keep the bring-up audio path clean.
-    MIC_Speech_init();
-#endif
 
     ESP_ERROR_CHECK(app_state_init());
 

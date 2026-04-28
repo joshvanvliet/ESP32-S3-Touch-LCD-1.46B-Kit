@@ -14,4 +14,18 @@ menu "Example Configuration"
         bool "This enables BLE 4.2 features."
         default y
 
+    config APP_WAKEWORD_ENABLED
+        bool "Enable WakeNet assistant capture trigger"
+        default y
+
+    config APP_WAKEWORD_RESUME_DELAY_MS
+        int "Delay before re-arming WakeNet after assistant activity"
+        default 800
+        depends on APP_WAKEWORD_ENABLED
+
+    config APP_WAKEWORD_STOP_TIMEOUT_MS
+        int "Timeout while stopping WakeNet before capture"
+        default 1200
+        depends on APP_WAKEWORD_ENABLED
+
 endmenu

@@ -6,6 +6,7 @@ idf_component_register(
         "./app_ble_link.c"
         "./app_state.c"
         "./app_ui.c"
+        "./app_wakeword.c"
         "./starter_ui.c"
         "./EXIO/TCA9554PWR.c"
         "./Audio_Driver/PCM5101.c"
