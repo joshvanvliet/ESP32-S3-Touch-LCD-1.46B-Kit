@@ -13,9 +13,15 @@ typedef struct {
     uint32_t rendered_fps;
     uint32_t blit_fps;
     uint32_t render_time_us;
+    uint32_t restore_time_us;
+    uint32_t draw_time_us;
+    uint32_t pack_time_us;
     uint32_t dirty_pixels;
+    uint32_t dirty_rect_count;
+    uint32_t lcd_chunk_count;
     uint32_t packed_bytes;
     uint32_t lcd_wait_time_us;
+    uint32_t full_refresh_count;
     uint32_t skipped_frames;
 } app_face_stats_t;
 

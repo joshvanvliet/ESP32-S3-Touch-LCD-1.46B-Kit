@@ -20,6 +20,8 @@ static lv_obj_t *s_passkey;
 static float s_recording_energy;
 static bool s_recording_energy_valid;
 
+#define APP_UI_SPEAKING_FACE_ENERGY 0.48f
+
 #define APP_AGENT_ACTIVITY_IDLE 0
 #define APP_AGENT_ACTIVITY_THINKING 1
 #define APP_AGENT_ACTIVITY_SPEAKING 2
@@ -191,7 +193,7 @@ void app_ui_set_agent_activity(uint8_t status)
             break;
         case APP_AGENT_ACTIVITY_SPEAKING:
             app_face_set_mode(APP_FACE_SPEAKING);
-            app_face_set_energy(0.82f);
+            app_face_set_energy(APP_UI_SPEAKING_FACE_ENERGY);
             if (s_status) {
                 lv_label_set_text(s_status, "Speaking");
                 app_ui_update_face_protection();

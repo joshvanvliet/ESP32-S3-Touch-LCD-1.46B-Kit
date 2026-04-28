@@ -75,15 +75,12 @@ static inline void blend_pixel_raw(lv_color_t *dst, app_face_rgb_t color, uint8_
         return;
     }
 
-    uint32_t base = lv_color_to32(*dst);
-    uint8_t br = (uint8_t)((base >> 16) & 0xFF);
-    uint8_t bg = (uint8_t)((base >> 8) & 0xFF);
-    uint8_t bb = (uint8_t)(base & 0xFF);
     uint16_t inv = (uint16_t)(255 - alpha);
-    uint8_t r = (uint8_t)(((uint16_t)color.r * alpha + (uint16_t)br * inv) / 255);
-    uint8_t g = (uint8_t)(((uint16_t)color.g * alpha + (uint16_t)bg * inv) / 255);
-    uint8_t b = (uint8_t)(((uint16_t)color.b * alpha + (uint16_t)bb * inv) / 255);
-    *dst = lv_color_make(r, g, b);
+    lv_color_t out;
+    LV_COLOR_SET_R(out, (uint8_t)(((uint16_t)(color.r >> 3) * alpha + (uint16_t)LV_COLOR_GET_R(*dst) * inv) / 255));
+    LV_COLOR_SET_G(out, (uint8_t)(((uint16_t)(color.g >> 2) * alpha + (uint16_t)LV_COLOR_GET_G(*dst) * inv) / 255));
+    LV_COLOR_SET_B(out, (uint8_t)(((uint16_t)(color.b >> 3) * alpha + (uint16_t)LV_COLOR_GET_B(*dst) * inv) / 255));
+    *dst = out;
 }
 
 static inline void blend_pixel(app_face_canvas_t *canvas, int x, int y, app_face_rgb_t color, uint8_t alpha)
@@ -412,24 +409,46 @@ void app_face_canvas_fill_transformed_ellipse(app_face_canvas_t *canvas,
     }
 
     float inv_det = 1.0f / det;
+    float a = vy * inv_det;
+    float b = -vx * inv_det;
+    float c = -uy * inv_det;
+    float d = ux * inv_det;
     float inv_rx_sq = 1.0f / (rx * rx);
     float inv_ry_sq = 1.0f / (ry * ry);
+    float qa = a * a * inv_rx_sq + c * c * inv_ry_sq;
+    float qb_scale = 2.0f * (a * b * inv_rx_sq + c * d * inv_ry_sq);
+    float qc_scale = b * b * inv_rx_sq + d * d * inv_ry_sq;
+    if (qa <= 0.000001f) {
+        return;
+    }
+
     for (int y = y1; y <= y2; y++) {
         int rx1 = x1;
         int rx2 = x2;
         if (!row_clip_bounds(canvas, y, &rx1, &rx2)) {
             continue;
         }
-        lv_color_t *row = &canvas->pixels[y * canvas->width];
-        for (int x = rx1; x <= rx2; x++) {
-            float dx = ((float)x + 0.5f) - cx;
-            float dy = ((float)y + 0.5f) - cy;
-            float local_x = (vy * dx - vx * dy) * inv_det;
-            float local_y = (-uy * dx + ux * dy) * inv_det;
-            float q = local_x * local_x * inv_rx_sq + local_y * local_y * inv_ry_sq;
-            if (q <= 1.0f) {
-                blend_pixel_raw(&row[x], color, alpha);
-            }
+        float dy = ((float)y + 0.5f) - cy;
+        float qb = qb_scale * dy;
+        float qc = qc_scale * dy * dy - 1.0f;
+        float disc = qb * qb - 4.0f * qa * qc;
+        if (disc < 0.0f) {
+            continue;
+        }
+        float root = sqrtf(disc);
+        float inv_2qa = 0.5f / qa;
+        float dx0 = (-qb - root) * inv_2qa;
+        float dx1 = (-qb + root) * inv_2qa;
+        int sx = (int)ceilf(cx + fminf(dx0, dx1) - 0.5f);
+        int ex = (int)floorf(cx + fmaxf(dx0, dx1) - 0.5f);
+        if (sx < rx1) {
+            sx = rx1;
+        }
+        if (ex > rx2) {
+            ex = rx2;
+        }
+        if (sx <= ex) {
+            blend_span(canvas, y, sx, ex, color, alpha);
         }
     }
 }

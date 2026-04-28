@@ -26,6 +26,10 @@
 #define CONFIG_APP_FACE_TX_BUFFER_BYTES 8192
 #endif
 
+#ifndef CONFIG_APP_FACE_TX_BUFFER_COUNT
+#define CONFIG_APP_FACE_TX_BUFFER_COUNT 1
+#endif
+
 #if !CONFIG_APP_FACE_ENABLED
 esp_err_t app_face_init(lv_obj_t *parent)
 {
@@ -48,11 +52,14 @@ bool app_face_get_stats(app_face_stats_t *out_stats) { (void)out_stats; return f
 static const char *TAG = "APP_FACE";
 
 #define APP_FACE_TX_BUFFER_BYTES CONFIG_APP_FACE_TX_BUFFER_BYTES
-#define APP_FACE_TX_BUFFER_COUNT 1
+#define APP_FACE_TX_BUFFER_COUNT CONFIG_APP_FACE_TX_BUFFER_COUNT
 #define APP_FACE_MAX_DIRTY_RECTS 10
 #define APP_FACE_MAX_BLIT_FRAGMENTS 16
 #define APP_FACE_MAX_PROTECTED_RECTS 4
-#define APP_FACE_DIRTY_MERGE_GAP 6
+#define APP_FACE_DIRTY_MERGE_GAP 3
+#define APP_FACE_PRIMITIVE_MARGIN_PX 3
+#define APP_FACE_INPUT_ENERGY_SCALE 0.5f
+#define APP_FACE_SPEAKING_INPUT_ENERGY_CAP 0.48f
 
 typedef struct {
     lv_area_t rects[APP_FACE_MAX_DIRTY_RECTS];
@@ -109,6 +116,40 @@ typedef struct {
     float visibility;
 } app_face_pair_frame_t;
 
+typedef enum {
+    APP_FACE_PRIMITIVE_EYE,
+    APP_FACE_PRIMITIVE_TRANSFORMED_ELLIPSE,
+} app_face_primitive_type_t;
+
+typedef struct {
+    app_face_primitive_type_t type;
+    lv_area_t bounds;
+    app_face_surface_t surface;
+    app_face_pair_frame_t frame;
+    app_face_mood_numbers_t mood;
+    app_face_rgb_t iris;
+    app_face_rgb_t pupil;
+    app_face_rgb_t color;
+    float cx;
+    float cy;
+    float eye_w;
+    float eye_h;
+    float look_x;
+    float look_y;
+    float scale;
+    float rx;
+    float ry;
+    uint8_t alpha;
+    int side;
+} app_face_render_primitive_t;
+
+#define APP_FACE_MAX_RENDER_PRIMITIVES 14
+
+typedef struct {
+    app_face_render_primitive_t items[APP_FACE_MAX_RENDER_PRIMITIVES];
+    size_t count;
+} app_face_render_plan_t;
+
 typedef struct {
     float x;
     float y;
@@ -152,12 +193,20 @@ typedef struct {
     uint32_t transition_start_ms;
     uint32_t last_frame_ms;
     uint32_t last_update_ms;
+    uint64_t last_frame_us;
     uint32_t stats_window_start_ms;
     uint32_t stats_rendered_frames;
     uint32_t stats_blit_frames;
     uint32_t stats_skipped_frames;
     uint32_t stats_dirty_pixels;
     uint32_t stats_packed_bytes;
+    uint32_t stats_dirty_rects;
+    uint32_t stats_lcd_chunks;
+    uint32_t stats_restore_time_us;
+    uint32_t stats_draw_time_us;
+    uint32_t stats_pack_time_us;
+    uint32_t stats_lcd_wait_time_us;
+    uint32_t stats_full_refreshes;
     app_face_stats_t stats;
     float time_s;
     float energy;
@@ -202,6 +251,21 @@ static uint32_t rng_range_ms(uint32_t min_ms, uint32_t max_ms)
 static uint8_t alpha_from_float(float alpha)
 {
     return (uint8_t)(app_face_clampf(alpha, 0.0f, 1.0f) * 255.0f);
+}
+
+static float speaking_energy_cap(void)
+{
+    return APP_FACE_SPEAKING_INPUT_ENERGY_CAP * APP_FACE_INPUT_ENERGY_SCALE;
+}
+
+static void apply_speaking_energy_cap(app_face_mode_t mode)
+{
+    if (mode != APP_FACE_SPEAKING) {
+        return;
+    }
+    float cap = speaking_energy_cap();
+    s_face.energy = fminf(s_face.energy, cap);
+    s_face.target_energy = fminf(s_face.target_energy, cap);
 }
 
 static int clamp_int(int value, int min_value, int max_value)
@@ -253,6 +317,22 @@ static void area_include_area(lv_area_t *area, const lv_area_t *other)
         return;
     }
     area_include_rect(area, other->x1, other->y1, other->x2, other->y2);
+}
+
+static void area_include_transformed_ellipse(lv_area_t *area,
+                                             float cx,
+                                             float cy,
+                                             float ux,
+                                             float uy,
+                                             float vx,
+                                             float vy,
+                                             float rx,
+                                             float ry,
+                                             float margin)
+{
+    float half_x = fabsf(ux) * rx + fabsf(vx) * ry + margin;
+    float half_y = fabsf(uy) * rx + fabsf(vy) * ry + margin;
+    area_include_rect(area, cx - half_x, cy - half_y, cx + half_x, cy + half_y);
 }
 
 static void area_inflate_clip(lv_area_t *area, int margin, int width, int height)
@@ -943,133 +1023,6 @@ static void pair_frame_point(const app_face_draw_layout_t *layout,
     *out_y = layout->cy + frame->y + frame->uy * local_x + frame->vy * local_y;
 }
 
-static void area_include_pair_frame_ellipse(lv_area_t *area,
-                                            const app_face_draw_layout_t *layout,
-                                            const app_face_pair_frame_t *frame,
-                                            float local_x,
-                                            float local_y,
-                                            float radius_x,
-                                            float radius_y,
-                                            float margin)
-{
-    float x;
-    float y;
-    pair_frame_point(layout, frame, local_x, local_y, &x, &y);
-    float half_x = fabsf(frame->ux) * radius_x + fabsf(frame->vx) * radius_y + margin;
-    float half_y = fabsf(frame->uy) * radius_x + fabsf(frame->vy) * radius_y + margin;
-    area_include_rect(area, x - half_x, y - half_y, x + half_x, y + half_y);
-}
-
-static void draw_screen(app_face_canvas_t *canvas,
-                        uint32_t now_ms,
-                        const app_face_mood_numbers_t *mood,
-                        app_face_rgb_t iris,
-                        app_face_rgb_t pupil,
-                        const app_face_energy_profile_t *energy,
-                        const app_face_draw_layout_t *layout)
-{
-    (void)now_ms;
-    float scale = layout->scale;
-    float cx = layout->cx;
-    float cy = layout->cy;
-    float radius = layout->radius;
-    float eye_w = layout->eye_w;
-    float eye_h = layout->eye_h;
-    const app_face_surface_t *left = &layout->left;
-    const app_face_surface_t *right = &layout->right;
-    float look_x = layout->look_x;
-    float look_y = layout->look_y;
-    app_face_canvas_set_clip_circle(canvas, layout->display_cx, layout->display_cy, radius - 2.0f);
-
-    if (left->z <= right->z) {
-        draw_eye(canvas, cx, cy, left, -1, mood, iris, pupil, eye_w, eye_h, look_x, look_y, scale);
-        draw_eye(canvas, cx, cy, right, 1, mood, iris, pupil, eye_w, eye_h, look_x, look_y, scale);
-    } else {
-        draw_eye(canvas, cx, cy, right, 1, mood, iris, pupil, eye_w, eye_h, look_x, look_y, scale);
-        draw_eye(canvas, cx, cy, left, -1, mood, iris, pupil, eye_w, eye_h, look_x, look_y, scale);
-    }
-
-    if (mood->think_dots > 0.05f) {
-        app_face_pair_frame_t frame = eye_pair_frame(layout);
-        float alpha = (0.46f + 0.16f * energy->lively) * mood->think_dots * frame.visibility;
-        float dot_y_base = -layout->local_h * 1.08f;
-        float dot_step = layout->sep * 0.42f;
-        for (int i = 0; i < 3; i++) {
-            float phase = s_face.time_s * (2.4f + energy->raw * 2.2f) + (float)i * 1.1f;
-            float local_x = ((float)i - 1.0f) * dot_step;
-            float local_y = dot_y_base + sinf(phase) * radius * 0.015f;
-            float dot_x;
-            float dot_y;
-            float dot_r = radius * (0.025f + (float)i * 0.004f);
-            pair_frame_point(layout, &frame, local_x, local_y, &dot_x, &dot_y);
-            app_face_canvas_fill_transformed_ellipse(canvas,
-                                                     dot_x,
-                                                     dot_y,
-                                                     frame.ux,
-                                                     frame.uy,
-                                                     frame.vx,
-                                                     frame.vy,
-                                                     dot_r,
-                                                     dot_r,
-                                                     iris,
-                                                     alpha_from_float(alpha));
-        }
-    }
-
-    if (mood->speaking_bars > 0.08f) {
-        app_face_pair_frame_t frame = eye_pair_frame(layout);
-        int count = 7;
-        float total = layout->sep * 1.36f;
-        float start = -total * 0.5f;
-        float local_y = layout->local_h * 1.28f;
-        float alpha = (0.26f + 0.38f * energy->lively) * mood->speaking_bars * frame.visibility;
-        for (int i = 0; i < count; i++) {
-            float amp = fabsf(sinf(s_face.time_s * (7.0f + energy->raw * 18.0f) + (float)i * 0.72f)) *
-                            radius * (0.05f + 0.13f * energy->lively) +
-                        radius * 0.02f;
-            float bar_x;
-            float bar_y;
-            float local_x = start + (float)i * (total / (float)(count - 1));
-            pair_frame_point(layout, &frame, local_x, local_y, &bar_x, &bar_y);
-            app_face_canvas_fill_transformed_ellipse(canvas,
-                                                     bar_x,
-                                                     bar_y,
-                                                     frame.ux,
-                                                     frame.uy,
-                                                     frame.vx,
-                                                     frame.vy,
-                                                     radius * 0.018f,
-                                                     amp * 0.5f,
-                                                     iris,
-                                                     alpha_from_float(alpha));
-        }
-    }
-
-    app_face_canvas_clear_clip(canvas);
-}
-
-static bool surface_bounds_area(const app_face_canvas_t *canvas,
-                                const app_face_draw_layout_t *layout,
-                                const app_face_surface_t *surface,
-                                float local_w,
-                                float local_h,
-                                float margin,
-                                lv_area_t *out)
-{
-    if (surface->visibility <= 0.01f) {
-        area_reset(out, canvas->width, canvas->height);
-        return false;
-    }
-    float half_x = (fabsf(surface->ux) * local_w + fabsf(surface->vx) * local_h) * 0.58f + margin;
-    float half_y = (fabsf(surface->uy) * local_w + fabsf(surface->vy) * local_h) * 0.58f + margin;
-    float cx = layout->cx + surface->x;
-    float cy = layout->cy + surface->y;
-    area_reset(out, canvas->width, canvas->height);
-    area_include_rect(out, cx - half_x, cy - half_y, cx + half_x, cy + half_y);
-    area_inflate_clip(out, (int)(layout->scale * 0.018f) + 6, canvas->width, canvas->height);
-    return !area_is_empty(out);
-}
-
 static lv_area_t display_dirty_area(const app_face_canvas_t *canvas, const app_face_draw_layout_t *layout)
 {
     float display_margin = 4.0f;
@@ -1095,70 +1048,274 @@ static bool clip_area_to_area(lv_area_t *area, const lv_area_t *clip, int width,
     return area_clip_to_bounds(area, width, height);
 }
 
-static void estimate_dynamic_list(const app_face_canvas_t *canvas,
-                                  const app_face_mood_numbers_t *mood,
-                                  const app_face_energy_profile_t *energy,
-                                  const app_face_draw_layout_t *layout,
-                                  app_face_dirty_list_t *list)
+static void render_plan_reset(app_face_render_plan_t *plan)
 {
-    dirty_list_reset(list);
-    lv_area_t display_area = display_dirty_area(canvas, layout);
-    float dynamic_margin = layout->scale * 0.038f;
-    lv_area_t area;
+    plan->count = 0;
+}
 
-    if (surface_bounds_area(canvas, layout, &layout->left, layout->eye_w, layout->local_h, dynamic_margin, &area) &&
-        clip_area_to_area(&area, &display_area, canvas->width, canvas->height)) {
-        dirty_list_add_area(list, area, canvas->width, canvas->height);
+static bool render_plan_add(app_face_render_plan_t *plan,
+                            app_face_render_primitive_t primitive,
+                            const lv_area_t *display_area,
+                            int width,
+                            int height)
+{
+    if (plan->count >= APP_FACE_MAX_RENDER_PRIMITIVES ||
+        !clip_area_to_area(&primitive.bounds, display_area, width, height)) {
+        return false;
+    }
+    plan->items[plan->count++] = primitive;
+    return true;
+}
+
+static bool eye_bounds_area(const app_face_canvas_t *canvas,
+                            const app_face_draw_layout_t *layout,
+                            const app_face_surface_t *surface,
+                            int side,
+                            const app_face_mood_numbers_t *mood,
+                            lv_area_t *out)
+{
+    area_reset(out, canvas->width, canvas->height);
+    if (surface->visibility <= 0.025f) {
+        return false;
     }
 
-    if (surface_bounds_area(canvas, layout, &layout->right, layout->eye_w, layout->local_h, dynamic_margin, &area) &&
-        clip_area_to_area(&area, &display_area, canvas->width, canvas->height)) {
-        dirty_list_add_area(list, area, canvas->width, canvas->height);
+    float round_eye = app_face_smoothf(app_face_clampf(mood->round_eye, 0.0f, 1.0f));
+    float local_h = app_face_lerpf(layout->eye_h, layout->eye_w, round_eye);
+    float close = (s_face.micro_squint + fmaxf(0.0f, mood->lid) * 0.12f) * (1.0f - round_eye * 0.65f);
+    float smile = app_face_smoothf(app_face_clampf(mood->smile, 0.0f, 1.0f));
+    float concave = app_face_smoothf(app_face_clampf(mood->concave_top, 0.0f, 1.0f));
+    float expressive_open = app_face_lerpf(mood->open, 1.0f, round_eye * 0.95f);
+    float open = app_face_clampf(expressive_open * s_face.blink.value * (1.0f - close * 0.86f), 0.03f, 1.08f);
+    bool use_fast_ellipse = round_eye > 0.72f && smile < 0.18f && concave < 0.20f && fabsf(mood->slant) < 0.18f;
+    float eye_cx = layout->cx + surface->x;
+    float eye_cy = layout->cy + surface->y;
+    const float margin = (float)APP_FACE_PRIMITIVE_MARGIN_PX;
+
+    if (use_fast_ellipse) {
+        float angle = mood->eye_tilt * 0.55f;
+        float c = cosf(angle);
+        float s = sinf(angle);
+        float ux = surface->ux * c + surface->vx * s;
+        float uy = surface->uy * c + surface->vy * s;
+        float vx = -surface->ux * s + surface->vx * c;
+        float vy = -surface->uy * s + surface->vy * c;
+        area_include_transformed_ellipse(out, eye_cx, eye_cy, ux, uy, vx, vy, layout->eye_w * 0.5f, local_h * open * 0.5f, margin);
+    } else {
+        app_face_vec2_t local[APP_FACE_MAX_POLY_POINTS];
+        app_face_vec2_t screen[APP_FACE_MAX_POLY_POINTS];
+        size_t n = build_eye_shape(mood, side, layout->eye_w, local_h, close, local, APP_FACE_MAX_POLY_POINTS);
+        for (size_t i = 0; i < n; i++) {
+            transformed_point(surface, layout->cx, layout->cy, local[i].x, local[i].y, &screen[i]);
+            area_include_rect(out, screen[i].x, screen[i].y, screen[i].x, screen[i].y);
+        }
+    }
+
+    float smile_pupil_fade = 1.0f - app_face_smoothf((mood->smile - 0.24f) / 0.62f);
+    if (smile_pupil_fade > 0.05f) {
+        float pupil_ratio = 0.15f + mood->pupil_size * 0.22f;
+        float pupil_w = layout->eye_w * pupil_ratio;
+        float base_pupil_h = local_h * app_face_clampf(app_face_lerpf(mood->open, 1.0f, round_eye * 0.95f), 0.12f, 1.0f) *
+                             (0.14f + mood->pupil_size * 0.15f);
+        float round_pupil_h = local_h * pupil_ratio * 0.92f;
+        float pupil_h = app_face_lerpf(base_pupil_h, round_pupil_h, round_eye);
+        float blink_pupil_alpha = app_face_smooth_range(0.055f, 0.20f, open);
+        pupil_h = fminf(pupil_h, local_h * open * 0.46f);
+        if (pupil_h > 0.55f && blink_pupil_alpha > 0.02f) {
+            float px = app_face_clampf(layout->look_x * layout->eye_w * 0.025f + mood->side_eye * layout->eye_w * 0.08f -
+                                           side * layout->eye_w * 0.018f,
+                                       -layout->eye_w * 0.20f,
+                                       layout->eye_w * 0.20f);
+            float py = app_face_clampf(layout->look_y * local_h * 0.025f - local_h * 0.016f, -local_h * 0.15f, local_h * 0.15f);
+            float pupil_cx = eye_cx + surface->ux * px + surface->vx * py;
+            float pupil_cy = eye_cy + surface->uy * px + surface->vy * py;
+            area_include_transformed_ellipse(out, pupil_cx, pupil_cy, surface->ux, surface->uy, surface->vx, surface->vy, pupil_w, pupil_h, margin);
+            if (mood->sparkle > 0.05f && mood->concave_top < 0.35f) {
+                area_include_transformed_ellipse(out,
+                                                 eye_cx + surface->ux * (px - side * pupil_w * 0.45f) + surface->vx * (py - pupil_h * 0.35f),
+                                                 eye_cy + surface->uy * (px - side * pupil_w * 0.45f) + surface->vy * (py - pupil_h * 0.35f),
+                                                 surface->ux,
+                                                 surface->uy,
+                                                 surface->vx,
+                                                 surface->vy,
+                                                 fmaxf(1.3f, layout->scale * 0.006f * mood->sparkle),
+                                                 fmaxf(1.3f, layout->scale * 0.006f * mood->sparkle),
+                                                 margin);
+            }
+        }
+    }
+
+    area_inflate_clip(out, APP_FACE_PRIMITIVE_MARGIN_PX, canvas->width, canvas->height);
+    return !area_is_empty(out);
+}
+
+static void add_eye_primitive(const app_face_canvas_t *canvas,
+                              app_face_render_plan_t *plan,
+                              const lv_area_t *display_area,
+                              const app_face_draw_layout_t *layout,
+                              const app_face_surface_t *surface,
+                              int side,
+                              const app_face_mood_numbers_t *mood,
+                              app_face_rgb_t iris,
+                              app_face_rgb_t pupil)
+{
+    app_face_render_primitive_t primitive = {
+        .type = APP_FACE_PRIMITIVE_EYE,
+        .surface = *surface,
+        .mood = *mood,
+        .iris = iris,
+        .pupil = pupil,
+        .cx = layout->cx,
+        .cy = layout->cy,
+        .eye_w = layout->eye_w,
+        .eye_h = layout->eye_h,
+        .look_x = layout->look_x,
+        .look_y = layout->look_y,
+        .scale = layout->scale,
+        .side = side,
+    };
+    if (!eye_bounds_area(canvas, layout, surface, side, mood, &primitive.bounds)) {
+        return;
+    }
+    render_plan_add(plan, primitive, display_area, canvas->width, canvas->height);
+}
+
+static void add_ellipse_primitive(const app_face_canvas_t *canvas,
+                                  app_face_render_plan_t *plan,
+                                  const lv_area_t *display_area,
+                                  float cx,
+                                  float cy,
+                                  const app_face_pair_frame_t *frame,
+                                  float rx,
+                                  float ry,
+                                  app_face_rgb_t color,
+                                  uint8_t alpha)
+{
+    app_face_render_primitive_t primitive = {
+        .type = APP_FACE_PRIMITIVE_TRANSFORMED_ELLIPSE,
+        .frame = *frame,
+        .color = color,
+        .cx = cx,
+        .cy = cy,
+        .rx = rx,
+        .ry = ry,
+        .alpha = alpha,
+    };
+    area_reset(&primitive.bounds, canvas->width, canvas->height);
+    area_include_transformed_ellipse(&primitive.bounds, cx, cy, frame->ux, frame->uy, frame->vx, frame->vy, rx, ry, APP_FACE_PRIMITIVE_MARGIN_PX);
+    area_inflate_clip(&primitive.bounds, APP_FACE_PRIMITIVE_MARGIN_PX, canvas->width, canvas->height);
+    render_plan_add(plan, primitive, display_area, canvas->width, canvas->height);
+}
+
+static void build_render_plan(const app_face_canvas_t *canvas,
+                              const app_face_mood_numbers_t *mood,
+                              app_face_rgb_t iris,
+                              app_face_rgb_t pupil,
+                              const app_face_energy_profile_t *energy,
+                              const app_face_draw_layout_t *layout,
+                              app_face_render_plan_t *plan)
+{
+    render_plan_reset(plan);
+    lv_area_t display_area = display_dirty_area(canvas, layout);
+    const app_face_surface_t *left = &layout->left;
+    const app_face_surface_t *right = &layout->right;
+    if (left->z <= right->z) {
+        add_eye_primitive(canvas, plan, &display_area, layout, left, -1, mood, iris, pupil);
+        add_eye_primitive(canvas, plan, &display_area, layout, right, 1, mood, iris, pupil);
+    } else {
+        add_eye_primitive(canvas, plan, &display_area, layout, right, 1, mood, iris, pupil);
+        add_eye_primitive(canvas, plan, &display_area, layout, left, -1, mood, iris, pupil);
     }
 
     if (mood->think_dots > 0.05f) {
         app_face_pair_frame_t frame = eye_pair_frame(layout);
-        area_reset(&area, canvas->width, canvas->height);
+        float alpha = (0.46f + 0.16f * energy->lively) * mood->think_dots * frame.visibility;
         float dot_y_base = -layout->local_h * 1.08f;
         float dot_step = layout->sep * 0.42f;
         for (int i = 0; i < 3; i++) {
+            float phase = s_face.time_s * (2.4f + energy->raw * 2.2f) + (float)i * 1.1f;
+            float local_x = ((float)i - 1.0f) * dot_step;
+            float local_y = dot_y_base + sinf(phase) * layout->radius * 0.015f;
+            float dot_x;
+            float dot_y;
             float dot_r = layout->radius * (0.025f + (float)i * 0.004f);
-            area_include_pair_frame_ellipse(&area,
-                                            layout,
-                                            &frame,
-                                            ((float)i - 1.0f) * dot_step,
-                                            dot_y_base,
-                                            dot_r,
-                                            dot_r + layout->radius * 0.018f,
-                                            4.0f);
-        }
-        area_inflate_clip(&area, 6, canvas->width, canvas->height);
-        if (clip_area_to_area(&area, &display_area, canvas->width, canvas->height)) {
-            dirty_list_add_area(list, area, canvas->width, canvas->height);
+            pair_frame_point(layout, &frame, local_x, local_y, &dot_x, &dot_y);
+            add_ellipse_primitive(canvas, plan, &display_area, dot_x, dot_y, &frame, dot_r, dot_r, iris, alpha_from_float(alpha));
         }
     }
 
     if (mood->speaking_bars > 0.08f) {
         app_face_pair_frame_t frame = eye_pair_frame(layout);
-        area_reset(&area, canvas->width, canvas->height);
         float total = layout->sep * 1.36f;
         float start = -total * 0.5f;
         float local_y = layout->local_h * 1.28f;
-        float amp = layout->radius * (0.06f + 0.15f * energy->lively);
+        float alpha = (0.26f + 0.38f * energy->lively) * mood->speaking_bars * frame.visibility;
         for (int i = 0; i < 7; i++) {
             float local_x = start + (float)i * (total / 6.0f);
-            area_include_pair_frame_ellipse(&area,
-                                            layout,
-                                            &frame,
-                                            local_x,
-                                            local_y,
-                                            layout->radius * 0.022f,
-                                            amp * 0.55f,
-                                            4.0f);
+            float amp = fabsf(sinf(s_face.time_s * (7.0f + energy->raw * 18.0f) + (float)i * 0.72f)) *
+                            layout->radius * (0.05f + 0.13f * energy->lively) +
+                        layout->radius * 0.02f;
+            float bar_x;
+            float bar_y;
+            pair_frame_point(layout, &frame, local_x, local_y, &bar_x, &bar_y);
+            add_ellipse_primitive(canvas,
+                                  plan,
+                                  &display_area,
+                                  bar_x,
+                                  bar_y,
+                                  &frame,
+                                  layout->radius * 0.018f,
+                                  amp * 0.5f,
+                                  iris,
+                                  alpha_from_float(alpha));
         }
-        area_inflate_clip(&area, 6, canvas->width, canvas->height);
-        if (clip_area_to_area(&area, &display_area, canvas->width, canvas->height)) {
-            dirty_list_add_area(list, area, canvas->width, canvas->height);
+    }
+}
+
+static void estimate_dynamic_list_from_plan(const app_face_canvas_t *canvas,
+                                            const app_face_render_plan_t *plan,
+                                            app_face_dirty_list_t *list)
+{
+    dirty_list_reset(list);
+    for (size_t i = 0; i < plan->count; i++) {
+        dirty_list_add_area(list, plan->items[i].bounds, canvas->width, canvas->height);
+    }
+}
+
+static void draw_render_plan(app_face_canvas_t *canvas,
+                             const app_face_render_plan_t *plan,
+                             const lv_area_t *dirty_area)
+{
+    for (size_t i = 0; i < plan->count; i++) {
+        const app_face_render_primitive_t *primitive = &plan->items[i];
+        if (dirty_area && !area_intersects(dirty_area, &primitive->bounds)) {
+            continue;
+        }
+        if (primitive->type == APP_FACE_PRIMITIVE_EYE) {
+            draw_eye(canvas,
+                     primitive->cx,
+                     primitive->cy,
+                     &primitive->surface,
+                     primitive->side,
+                     &primitive->mood,
+                     primitive->iris,
+                     primitive->pupil,
+                     primitive->eye_w,
+                     primitive->eye_h,
+                     primitive->look_x,
+                     primitive->look_y,
+                     primitive->scale);
+        } else {
+            app_face_canvas_fill_transformed_ellipse(canvas,
+                                                     primitive->cx,
+                                                     primitive->cy,
+                                                     primitive->frame.ux,
+                                                     primitive->frame.uy,
+                                                     primitive->frame.vx,
+                                                     primitive->frame.vy,
+                                                     primitive->rx,
+                                                     primitive->ry,
+                                                     primitive->color,
+                                                     primitive->alpha);
         }
     }
 }
@@ -1231,6 +1388,8 @@ static size_t subtract_protected_areas(const lv_area_t *area, lv_area_t *out_fra
 
 static esp_err_t blit_area_from_framebuffer(const lv_area_t *area,
                                             uint32_t *packed_bytes,
+                                            uint32_t *pack_time_us,
+                                            uint32_t *lcd_chunk_count,
                                             uint32_t *lcd_wait_us)
 {
     if (area_is_empty(area) || !s_face.tx_buffers[0]) {
@@ -1266,14 +1425,21 @@ static esp_err_t blit_area_from_framebuffer(const lv_area_t *area,
         lv_color_t *tx = s_face.tx_buffers[s_face.tx_index % APP_FACE_TX_BUFFER_COUNT];
         s_face.tx_index++;
         size_t row_bytes = (size_t)width * sizeof(lv_color_t);
+        int64_t pack_start = esp_timer_get_time();
         for (int row = 0; row < rows; row++) {
             memcpy(&tx[row * width],
                    &s_face.pixels[(y + row) * s_face.canvas.width + area->x1],
                    row_bytes);
         }
+        if (pack_time_us) {
+            *pack_time_us += (uint32_t)(esp_timer_get_time() - pack_start);
+        }
 
         if (packed_bytes) {
             *packed_bytes += (uint32_t)(row_bytes * (size_t)rows);
+        }
+        if (lcd_chunk_count) {
+            (*lcd_chunk_count)++;
         }
         err = app_lcd_blit_rect_async(area->x1, y, width, rows, tx, NULL, NULL);
         if (err != ESP_OK) {
@@ -1286,6 +1452,8 @@ static esp_err_t blit_area_from_framebuffer(const lv_area_t *area,
 static esp_err_t blit_dirty_area(const lv_area_t *area,
                                  uint32_t *dirty_pixels,
                                  uint32_t *packed_bytes,
+                                 uint32_t *pack_time_us,
+                                 uint32_t *lcd_chunk_count,
                                  uint32_t *lcd_wait_us)
 {
     lv_area_t fragments[APP_FACE_MAX_BLIT_FRAGMENTS];
@@ -1299,7 +1467,7 @@ static esp_err_t blit_dirty_area(const lv_area_t *area,
         if (dirty_pixels) {
             *dirty_pixels += area_pixel_count(&fragment);
         }
-        esp_err_t err = blit_area_from_framebuffer(&fragment, packed_bytes, lcd_wait_us);
+        esp_err_t err = blit_area_from_framebuffer(&fragment, packed_bytes, pack_time_us, lcd_chunk_count, lcd_wait_us);
         if (err != ESP_OK) {
             final_err = err;
         }
@@ -1309,16 +1477,30 @@ static esp_err_t blit_dirty_area(const lv_area_t *area,
 
 static void update_stats(uint32_t now_ms,
                          uint32_t render_time_us,
+                         uint32_t restore_time_us,
+                         uint32_t draw_time_us,
+                         uint32_t pack_time_us,
                          uint32_t dirty_pixels,
+                         uint32_t dirty_rect_count,
+                         uint32_t lcd_chunk_count,
                          uint32_t packed_bytes,
                          uint32_t lcd_wait_us,
+                         bool full_refresh,
                          bool blitted)
 {
     s_face.stats.target_fps = CONFIG_APP_FACE_FPS;
     s_face.stats.render_time_us = render_time_us;
+    s_face.stats.restore_time_us = restore_time_us;
+    s_face.stats.draw_time_us = draw_time_us;
+    s_face.stats.pack_time_us = pack_time_us;
     s_face.stats.dirty_pixels = dirty_pixels;
+    s_face.stats.dirty_rect_count = dirty_rect_count;
+    s_face.stats.lcd_chunk_count = lcd_chunk_count;
     s_face.stats.packed_bytes = packed_bytes;
     s_face.stats.lcd_wait_time_us = lcd_wait_us;
+    if (full_refresh) {
+        s_face.stats.full_refresh_count++;
+    }
 
     s_face.stats_rendered_frames++;
     if (blitted) {
@@ -1326,22 +1508,46 @@ static void update_stats(uint32_t now_ms,
     }
     s_face.stats_dirty_pixels += dirty_pixels;
     s_face.stats_packed_bytes += packed_bytes;
+    s_face.stats_dirty_rects += dirty_rect_count;
+    s_face.stats_lcd_chunks += lcd_chunk_count;
+    s_face.stats_restore_time_us += restore_time_us;
+    s_face.stats_draw_time_us += draw_time_us;
+    s_face.stats_pack_time_us += pack_time_us;
+    s_face.stats_lcd_wait_time_us += lcd_wait_us;
+    if (full_refresh) {
+        s_face.stats_full_refreshes++;
+    }
 
     uint32_t elapsed = elapsed_ms(now_ms, s_face.stats_window_start_ms);
     if (elapsed >= 1000u) {
         s_face.stats.rendered_fps = (s_face.stats_rendered_frames * 1000u) / elapsed;
         s_face.stats.blit_fps = (s_face.stats_blit_frames * 1000u) / elapsed;
         s_face.stats.skipped_frames = s_face.stats_skipped_frames;
+        s_face.stats.dirty_pixels = s_face.stats_dirty_pixels;
+        s_face.stats.packed_bytes = s_face.stats_packed_bytes;
+        s_face.stats.dirty_rect_count = s_face.stats_dirty_rects;
+        s_face.stats.lcd_chunk_count = s_face.stats_lcd_chunks;
+        s_face.stats.restore_time_us = s_face.stats_restore_time_us;
+        s_face.stats.draw_time_us = s_face.stats_draw_time_us;
+        s_face.stats.pack_time_us = s_face.stats_pack_time_us;
+        s_face.stats.lcd_wait_time_us = s_face.stats_lcd_wait_time_us;
+        s_face.stats.full_refresh_count = s_face.stats_full_refreshes;
 #if CONFIG_APP_FACE_PROFILE
         ESP_LOGI(TAG,
-                 "face target=%lu render=%lu blit=%lu render_us=%lu dirty=%lu packed=%lu wait_us=%lu skipped=%lu",
+                 "face target=%lu render=%lu blit=%lu render_us=%lu restore_us=%lu draw_us=%lu pack_us=%lu dirty_px=%lu dirty_rects=%lu chunks=%lu packed=%lu wait_us=%lu full=%lu skipped=%lu",
                  (unsigned long)s_face.stats.target_fps,
                  (unsigned long)s_face.stats.rendered_fps,
                  (unsigned long)s_face.stats.blit_fps,
                  (unsigned long)s_face.stats.render_time_us,
+                 (unsigned long)s_face.stats.restore_time_us,
+                 (unsigned long)s_face.stats.draw_time_us,
+                 (unsigned long)s_face.stats.pack_time_us,
                  (unsigned long)s_face.stats.dirty_pixels,
+                 (unsigned long)s_face.stats.dirty_rect_count,
+                 (unsigned long)s_face.stats.lcd_chunk_count,
                  (unsigned long)s_face.stats.packed_bytes,
                  (unsigned long)s_face.stats.lcd_wait_time_us,
+                 (unsigned long)s_face.stats.full_refresh_count,
                  (unsigned long)s_face.stats.skipped_frames);
 #endif
         s_face.stats_window_start_ms = now_ms;
@@ -1350,6 +1556,13 @@ static void update_stats(uint32_t now_ms,
         s_face.stats_skipped_frames = 0;
         s_face.stats_dirty_pixels = 0;
         s_face.stats_packed_bytes = 0;
+        s_face.stats_dirty_rects = 0;
+        s_face.stats_lcd_chunks = 0;
+        s_face.stats_restore_time_us = 0;
+        s_face.stats_draw_time_us = 0;
+        s_face.stats_pack_time_us = 0;
+        s_face.stats_lcd_wait_time_us = 0;
+        s_face.stats_full_refreshes = 0;
     }
 }
 
@@ -1437,8 +1650,11 @@ static void render(uint32_t now_ms)
     app_face_draw_layout_t layout;
     compute_draw_layout(&s_face.canvas, &mood, &energy, &layout);
 
+    app_face_render_plan_t render_plan;
+    build_render_plan(&s_face.canvas, &mood, iris, pupil, &energy, &layout, &render_plan);
+
     app_face_dirty_list_t current_list;
-    estimate_dynamic_list(&s_face.canvas, &mood, &energy, &layout, &current_list);
+    estimate_dynamic_list_from_plan(&s_face.canvas, &render_plan, &current_list);
 
     app_face_dirty_list_t dirty_list;
     dirty_list_reset(&dirty_list);
@@ -1451,7 +1667,11 @@ static void render(uint32_t now_ms)
 
     uint32_t dirty_pixels = 0;
     uint32_t packed_bytes = 0;
+    uint32_t pack_time_us = 0;
+    uint32_t lcd_chunk_count = 0;
     uint32_t lcd_wait_us = 0;
+    uint32_t restore_time_us = 0;
+    uint32_t draw_time_us = 0;
     bool blitted = false;
 
     if (s_face.base_pixels) {
@@ -1460,22 +1680,37 @@ static void render(uint32_t now_ms)
             if (!area_clip_to_bounds(&area, s_face.canvas.width, s_face.canvas.height)) {
                 continue;
             }
+            int64_t restore_start = esp_timer_get_time();
             app_face_canvas_restore_region(&s_face.canvas,
                                            &s_face.base_canvas,
                                            area.x1,
                                            area.y1,
                                            area.x2,
                                            area.y2);
+            restore_time_us += (uint32_t)(esp_timer_get_time() - restore_start);
+            int64_t draw_start = esp_timer_get_time();
             app_face_canvas_set_clip_rect(&s_face.canvas, area.x1, area.y1, area.x2, area.y2);
-            draw_screen(&s_face.canvas, now_ms, &mood, iris, pupil, &energy, &layout);
+            app_face_canvas_set_clip_circle(&s_face.canvas, layout.display_cx, layout.display_cy, layout.radius - 2.0f);
+            draw_render_plan(&s_face.canvas, &render_plan, &area);
+            app_face_canvas_clear_clip(&s_face.canvas);
+            draw_time_us += (uint32_t)(esp_timer_get_time() - draw_start);
         }
     } else {
         app_face_canvas_clear(&s_face.canvas, (app_face_rgb_t){.r = 1, .g = 2, .b = 5});
-        draw_screen(&s_face.canvas, now_ms, &mood, iris, pupil, &energy, &layout);
+        int64_t draw_start = esp_timer_get_time();
+        app_face_canvas_set_clip_circle(&s_face.canvas, layout.display_cx, layout.display_cy, layout.radius - 2.0f);
+        draw_render_plan(&s_face.canvas, &render_plan, NULL);
+        app_face_canvas_clear_clip(&s_face.canvas);
+        draw_time_us += (uint32_t)(esp_timer_get_time() - draw_start);
     }
 
     for (size_t i = 0; i < dirty_list.count; i++) {
-        esp_err_t err = blit_dirty_area(&dirty_list.rects[i], &dirty_pixels, &packed_bytes, &lcd_wait_us);
+        esp_err_t err = blit_dirty_area(&dirty_list.rects[i],
+                                        &dirty_pixels,
+                                        &packed_bytes,
+                                        &pack_time_us,
+                                        &lcd_chunk_count,
+                                        &lcd_wait_us);
         if (err == ESP_OK) {
             blitted = true;
         } else {
@@ -1488,7 +1723,18 @@ static void render(uint32_t now_ms)
     s_face.full_refresh_requested = false;
 
     uint32_t render_time_us = (uint32_t)(esp_timer_get_time() - render_start_us);
-    update_stats(now_ms, render_time_us, dirty_pixels, packed_bytes, lcd_wait_us, blitted);
+    update_stats(now_ms,
+                 render_time_us,
+                 restore_time_us,
+                 draw_time_us,
+                 pack_time_us,
+                 dirty_pixels,
+                 (uint32_t)dirty_list.count,
+                 lcd_chunk_count,
+                 packed_bytes,
+                 lcd_wait_us,
+                 full_refresh,
+                 blitted);
 }
 
 esp_err_t app_face_init(lv_obj_t *parent)
@@ -1501,11 +1747,12 @@ esp_err_t app_face_init(lv_obj_t *parent)
     s_face.target_mode = APP_FACE_IDLE;
     s_face.base_mode = APP_FACE_IDLE;
     s_face.pulse_return_mode = APP_FACE_IDLE;
-    s_face.energy = 0.42f;
-    s_face.target_energy = 0.42f;
+    s_face.energy = 0.21f;
+    s_face.target_energy = 0.21f;
     s_face.blink.value = 1.0f;
-    s_face.rng = 0xA511E9E5u ^ (uint32_t)lv_tick_get();
-    s_face.last_frame_ms = lv_tick_get();
+    s_face.last_frame_us = (uint64_t)esp_timer_get_time();
+    s_face.last_frame_ms = (uint32_t)(s_face.last_frame_us / 1000ULL);
+    s_face.rng = 0xA511E9E5u ^ s_face.last_frame_ms;
     s_face.last_update_ms = s_face.last_frame_ms;
     s_face.transition_start_ms = s_face.last_frame_ms;
     s_face.blink.next_ms = s_face.last_frame_ms + APP_FACE_DEFAULT_CONFIG.motion.initial_blink_delay_ms;
@@ -1587,6 +1834,7 @@ void app_face_set_mode(app_face_mode_t mode)
     uint32_t now_ms = lv_tick_get();
     s_face.base_mode = mode;
     s_face.pulse_return_mode = mode;
+    apply_speaking_energy_cap(mode);
     if (!s_face.pulse_active) {
         set_transition_target(mode, now_ms);
     }
@@ -1606,7 +1854,11 @@ void app_face_pulse_mode(app_face_mode_t mode, uint32_t duration_ms)
 
 void app_face_set_energy(float energy_0_to_1)
 {
-    s_face.target_energy = app_face_clampf(energy_0_to_1, 0.0f, 1.0f);
+    float input = app_face_clampf(energy_0_to_1, 0.0f, 1.0f);
+    if (s_face.target_mode == APP_FACE_SPEAKING) {
+        input = fminf(input, APP_FACE_SPEAKING_INPUT_ENERGY_CAP);
+    }
+    s_face.target_energy = app_face_clampf(input * APP_FACE_INPUT_ENERGY_SCALE, 0.0f, 1.0f);
 }
 
 void app_face_set_axes(float axis_x, float axis_y, float axis_z)
@@ -1677,16 +1929,24 @@ void app_face_tap(void)
 
 void app_face_tick(uint32_t now_ms)
 {
+    (void)now_ms;
     if (!s_face.initialized) {
         return;
     }
-    uint32_t min_frame_ms = 1000u / (CONFIG_APP_FACE_FPS > 0 ? CONFIG_APP_FACE_FPS : 30u);
-    if (elapsed_ms(now_ms, s_face.last_frame_ms) < min_frame_ms) {
+    uint32_t fps = CONFIG_APP_FACE_FPS > 0 ? CONFIG_APP_FACE_FPS : 30u;
+    uint64_t frame_period_us = 1000000ULL / (uint64_t)fps;
+    uint64_t frame_now_us = (uint64_t)esp_timer_get_time();
+    uint64_t frame_elapsed_us = frame_now_us - s_face.last_frame_us;
+    if (frame_elapsed_us < frame_period_us) {
         return;
     }
-    s_face.last_frame_ms = now_ms;
-    update_runtime(now_ms);
-    render(now_ms);
+    if (frame_elapsed_us >= frame_period_us * 2ULL) {
+        s_face.stats_skipped_frames += (uint32_t)(frame_elapsed_us / frame_period_us) - 1u;
+    }
+    s_face.last_frame_us = frame_now_us;
+    s_face.last_frame_ms = (uint32_t)(frame_now_us / 1000ULL);
+    update_runtime(s_face.last_frame_ms);
+    render(s_face.last_frame_ms);
 }
 
 #endif

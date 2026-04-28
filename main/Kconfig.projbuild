@@ -44,6 +44,12 @@ menu "Example Configuration"
         default 8192
         depends on APP_FACE_ENABLED
 
+    config APP_FACE_TX_BUFFER_COUNT
+        int "Animated face LCD transfer buffer count"
+        range 1 2
+        default 1
+        depends on APP_FACE_ENABLED
+
     config APP_FACE_USE_IMU
         bool "Drive animated assistant face from QMI8658 tilt"
         default y
@@ -51,7 +57,7 @@ menu "Example Configuration"
 
     config APP_MOTION_LOG_ENABLED
         bool "Log QMI8658 motion calibration samples"
-        default y
+        default n
         depends on APP_FACE_USE_IMU
 
     config APP_MOTION_LOG_INTERVAL_MS

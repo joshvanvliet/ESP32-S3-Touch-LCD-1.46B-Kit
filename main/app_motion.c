@@ -11,7 +11,7 @@
 #include "sdkconfig.h"
 
 #ifndef CONFIG_APP_MOTION_LOG_ENABLED
-#define CONFIG_APP_MOTION_LOG_ENABLED 1
+#define CONFIG_APP_MOTION_LOG_ENABLED 0
 #endif
 
 #ifndef CONFIG_APP_MOTION_LOG_INTERVAL_MS
@@ -50,7 +50,9 @@
 #define APP_MOTION_POSE_MOVING_DPS 9.0f
 #define APP_MOTION_POSE_ACCEL_DELTA 0.025f
 
+#if CONFIG_APP_MOTION_LOG_ENABLED
 static const char *TAG = "APP_MOTION";
+#endif
 
 static portMUX_TYPE s_motion_lock = portMUX_INITIALIZER_UNLOCKED;
 static float s_gx;
@@ -103,6 +105,7 @@ static float with_deadband(float value, float deadband)
     return value > 0.0f ? value - deadband : value + deadband;
 }
 
+#if CONFIG_APP_MOTION_LOG_ENABLED
 static const char *dominant_gravity_axis(float gx, float gy, float gz)
 {
     float ax = fabsf(gx);
@@ -116,6 +119,7 @@ static const char *dominant_gravity_axis(float gx, float gy, float gz)
     }
     return gz >= 0.0f ? "+Z" : "-Z";
 }
+#endif
 
 void app_motion_reset(void)
 {
@@ -153,6 +157,7 @@ void app_motion_update_from_imu(float accel_x_g,
     float gz = accel_z_g / len;
     float gyro_mag = sqrtf(gyro_x_dps * gyro_x_dps + gyro_y_dps * gyro_y_dps + gyro_z_dps * gyro_z_dps);
 
+#if CONFIG_APP_MOTION_LOG_ENABLED
     bool should_log = false;
     float log_gx = 0.0f;
     float log_gy = 0.0f;
@@ -173,6 +178,7 @@ void app_motion_update_from_imu(float accel_x_g,
     float log_corrected_gyro_x = 0.0f;
     float log_corrected_gyro_y = 0.0f;
     float log_corrected_gyro_z = 0.0f;
+#endif
 
     portENTER_CRITICAL(&s_motion_lock);
     float dt_s = 0.02f;
@@ -269,10 +275,13 @@ void app_motion_update_from_imu(float accel_x_g,
                                                        APP_MOTION_ROLL_UNRELIABLE_DECAY);
         }
 
+#if CONFIG_APP_MOTION_LOG_ENABLED
         log_motion_x = motion_x;
         log_motion_y = motion_y;
+#endif
     }
 
+#if CONFIG_APP_MOTION_LOG_ENABLED
     float display_gravity_roll = 0.0f;
     float display_plane_strength = 0.0f;
     bool display_roll_reliable = roll_from_gravity(s_gx, s_gy, &display_gravity_roll, &display_plane_strength);
@@ -290,7 +299,6 @@ void app_motion_update_from_imu(float accel_x_g,
         pose_mode = "moving";
     }
 
-#if CONFIG_APP_MOTION_LOG_ENABLED
     if (s_last_log_us == 0 ||
         (uint64_t)(now_us - s_last_log_us) >= (uint64_t)CONFIG_APP_MOTION_LOG_INTERVAL_MS * 1000ULL) {
         s_last_log_us = now_us;
