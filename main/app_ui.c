@@ -1,5 +1,6 @@
 #include "app_ui.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -16,14 +17,13 @@ static app_device_state_t s_state = APP_STATE_UNPAIRED;
 static lv_obj_t *s_root;
 static lv_obj_t *s_status;
 static lv_obj_t *s_passkey;
-static lv_obj_t *s_transcript;
-static uint32_t s_transcript_visible_until_ms;
+static float s_recording_energy;
+static bool s_recording_energy_valid;
 
 #define APP_AGENT_ACTIVITY_IDLE 0
 #define APP_AGENT_ACTIVITY_THINKING 1
 #define APP_AGENT_ACTIVITY_SPEAKING 2
 #define APP_AGENT_ACTIVITY_ERROR 3
-#define APP_UI_TRANSCRIPT_VISIBLE_MS 9000
 
 static app_face_mode_t app_ui_face_mode_for_state(app_device_state_t state)
 {
@@ -87,11 +87,10 @@ static void app_ui_add_protected_label(lv_obj_t *label, lv_area_t *areas, size_t
 
 static void app_ui_update_face_protection(void)
 {
-    lv_area_t areas[4];
+    lv_area_t areas[2];
     size_t count = 0;
-    app_ui_add_protected_label(s_status, areas, &count, 4);
-    app_ui_add_protected_label(s_passkey, areas, &count, 4);
-    app_ui_add_protected_label(s_transcript, areas, &count, 4);
+    app_ui_add_protected_label(s_status, areas, &count, 2);
+    app_ui_add_protected_label(s_passkey, areas, &count, 2);
     app_face_set_protected_areas(areas, count);
 }
 
@@ -156,12 +155,9 @@ void app_ui_init(const app_ui_callbacks_t *callbacks)
 
     s_status = app_ui_create_overlay_label(s_root, LV_ALIGN_TOP_MID, 14);
     s_passkey = app_ui_create_overlay_label(s_root, LV_ALIGN_CENTER, 90);
-    s_transcript = app_ui_create_overlay_label(s_root, LV_ALIGN_BOTTOM_MID, -18);
 
     lv_label_set_text(s_passkey, "");
     lv_obj_add_flag(s_passkey, LV_OBJ_FLAG_HIDDEN);
-    lv_label_set_text(s_transcript, "");
-    lv_obj_add_flag(s_transcript, LV_OBJ_FLAG_HIDDEN);
 
     app_ui_apply_state();
     app_ui_update_face_protection();
@@ -172,15 +168,13 @@ void app_ui_process(void)
 {
     uint32_t now_ms = lv_tick_get();
     app_face_tick(now_ms);
-    if (s_transcript && s_transcript_visible_until_ms != 0 && now_ms - s_transcript_visible_until_ms < 0x80000000u) {
-        s_transcript_visible_until_ms = 0;
-        lv_obj_add_flag(s_transcript, LV_OBJ_FLAG_HIDDEN);
-        app_ui_update_face_protection();
-    }
 }
 
 void app_ui_set_state(app_device_state_t state)
 {
+    if (s_state != state) {
+        s_recording_energy_valid = false;
+    }
     s_state = state;
     app_ui_apply_state();
 }
@@ -261,23 +255,31 @@ void app_ui_set_pairing_passkey(uint32_t passkey, bool visible)
 
 void app_ui_set_recording_level(uint16_t level)
 {
+    if (s_state != APP_STATE_RECORDING) {
+        s_recording_energy = 0.42f;
+        s_recording_energy_valid = false;
+        app_face_set_energy(s_recording_energy);
+        return;
+    }
+
     uint16_t clipped = level > 1000 ? 1000 : level;
     float normalized = (float)clipped / 1000.0f;
-    app_face_set_energy(0.38f + normalized * 0.62f);
+    float gated = normalized <= 0.08f ? 0.0f : (normalized - 0.08f) / 0.92f;
+    float compressed = sqrtf(gated > 0.0f ? gated : 0.0f);
+    float target = 0.40f + compressed * 0.24f;
+    if (!s_recording_energy_valid) {
+        s_recording_energy = target;
+        s_recording_energy_valid = true;
+    } else {
+        float smoothing = target > s_recording_energy ? 0.16f : 0.06f;
+        s_recording_energy += (target - s_recording_energy) * smoothing;
+    }
+    app_face_set_energy(s_recording_energy);
 }
 
 void app_ui_set_transcript(const char *text, uint8_t status)
 {
-    if (!s_transcript) {
-        return;
-    }
-
-    char buf[APP_MAX_TRANSCRIPT_BYTES + 20];
-    snprintf(buf, sizeof(buf), "%s%s", status == 0 ? "" : "[Check] ", text ? text : "");
-    lv_label_set_text(s_transcript, buf);
-    lv_obj_clear_flag(s_transcript, LV_OBJ_FLAG_HIDDEN);
-    s_transcript_visible_until_ms = lv_tick_get() + APP_UI_TRANSCRIPT_VISIBLE_MS;
-    app_ui_update_face_protection();
+    (void)text;
 
     if (status == 0) {
         app_face_pulse_mode(APP_FACE_HAPPY, 900);

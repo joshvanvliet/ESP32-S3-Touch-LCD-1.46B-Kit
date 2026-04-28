@@ -95,10 +95,10 @@ const app_face_mode_style_t APP_FACE_MODE_STYLES[APP_FACE_MODE_COUNT] = {
     },
     [APP_FACE_LISTENING] = {
         .name = "listening",
-        .ambient_gaze = true,
+        .ambient_gaze = false,
         .iris = RGB(0x74FFF1),
         .pupil = RGB(0x119EAA),
-        .v = {.eye_w = 0.35f, .eye_h = 0.47f, .sep = 0.42f, .y = -0.055f, .open = 1.0f, .round_eye = 1.0f, .lid = -0.10f, .pupil_size = 0.58f, .sparkle = 0.22f, .cheek = 0.12f, .nod = 1.0f, .bounce = 0.12f, .pulse = 0.72f, .bob = 1.18f, .shell = -0.03f, .shell_tint = 0.24f},
+        .v = {.eye_w = 0.35f, .eye_h = 0.47f, .sep = 0.42f, .y = -0.055f, .open = 1.0f, .round_eye = 1.0f, .lid = -0.10f, .pupil_size = 0.58f, .sparkle = 0.22f, .cheek = 0.12f, .nod = 0.38f, .bounce = 0.04f, .pulse = 0.34f, .bob = 0.46f, .shell = -0.03f, .shell_tint = 0.24f},
     },
     [APP_FACE_THINKING] = {
         .name = "thinking",
