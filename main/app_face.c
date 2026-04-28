@@ -102,6 +102,16 @@ typedef struct {
 typedef struct {
     float x;
     float y;
+    float ux;
+    float uy;
+    float vx;
+    float vy;
+    float visibility;
+} app_face_pair_frame_t;
+
+typedef struct {
+    float x;
+    float y;
     float start_x;
     float start_y;
     float target_x;
@@ -749,11 +759,16 @@ static void draw_eye(app_face_canvas_t *canvas,
                          (0.14f + mood->pupil_size * 0.15f);
     float round_pupil_h = local_h * pupil_ratio * 0.92f;
     float pupil_h = app_face_lerpf(base_pupil_h, round_pupil_h, round_eye);
+    float blink_pupil_alpha = app_face_smooth_range(0.055f, 0.20f, open);
+    pupil_h = fminf(pupil_h, local_h * open * 0.46f);
+    if (pupil_h <= 0.55f || blink_pupil_alpha <= 0.02f) {
+        return;
+    }
     float px = app_face_clampf(look_x * eye_w * 0.025f + mood->side_eye * eye_w * 0.08f - side * eye_w * 0.018f,
                                -eye_w * 0.20f,
                                eye_w * 0.20f);
     float py = app_face_clampf(look_y * local_h * 0.025f - local_h * 0.016f, -local_h * 0.15f, local_h * 0.15f);
-    float alpha = surface->visibility * smile_pupil_fade;
+    float alpha = surface->visibility * smile_pupil_fade * blink_pupil_alpha;
     app_face_canvas_fill_transformed_ellipse(canvas,
                                              cx + surface->x + surface->ux * px + surface->vx * py,
                                              cy + surface->y + surface->uy * px + surface->vy * py,
@@ -870,6 +885,81 @@ static void compute_draw_layout(const app_face_canvas_t *canvas,
                                      1.0f);
 }
 
+static app_face_pair_frame_t eye_pair_frame(const app_face_draw_layout_t *layout)
+{
+    const app_face_surface_t *left = &layout->left;
+    const app_face_surface_t *right = &layout->right;
+    app_face_pair_frame_t frame = {
+        .x = (left->x + right->x) * 0.5f,
+        .y = (left->y + right->y) * 0.5f,
+        .ux = (left->ux + right->ux) * 0.5f,
+        .uy = (left->uy + right->uy) * 0.5f,
+        .vx = (left->vx + right->vx) * 0.5f,
+        .vy = (left->vy + right->vy) * 0.5f,
+        .visibility = fmaxf(left->visibility, right->visibility),
+    };
+
+    float dx = right->x - left->x;
+    float dy = right->y - left->y;
+    float pair_len = sqrtf(dx * dx + dy * dy);
+    float expected_pair_len = fmaxf(1.0f, layout->sep * 2.0f);
+    float pair_scale = app_face_clampf(pair_len / expected_pair_len, 0.32f, 1.20f);
+
+    float u_len = sqrtf(frame.ux * frame.ux + frame.uy * frame.uy);
+    if (u_len < 0.18f && pair_len > 1.0f) {
+        frame.ux = (dx / pair_len) * pair_scale;
+        frame.uy = (dy / pair_len) * pair_scale;
+        u_len = pair_scale;
+    } else if (u_len < 0.0001f) {
+        frame.ux = 1.0f;
+        frame.uy = 0.0f;
+        u_len = 1.0f;
+    }
+
+    float v_len = sqrtf(frame.vx * frame.vx + frame.vy * frame.vy);
+    if (v_len < 0.18f) {
+        frame.vx = -frame.uy;
+        frame.vy = frame.ux;
+        v_len = u_len;
+    }
+
+    float det = frame.ux * frame.vy - frame.uy * frame.vx;
+    if (det < 0.0f) {
+        frame.vx = -frame.vx;
+        frame.vy = -frame.vy;
+    }
+
+    return frame;
+}
+
+static void pair_frame_point(const app_face_draw_layout_t *layout,
+                             const app_face_pair_frame_t *frame,
+                             float local_x,
+                             float local_y,
+                             float *out_x,
+                             float *out_y)
+{
+    *out_x = layout->cx + frame->x + frame->ux * local_x + frame->vx * local_y;
+    *out_y = layout->cy + frame->y + frame->uy * local_x + frame->vy * local_y;
+}
+
+static void area_include_pair_frame_ellipse(lv_area_t *area,
+                                            const app_face_draw_layout_t *layout,
+                                            const app_face_pair_frame_t *frame,
+                                            float local_x,
+                                            float local_y,
+                                            float radius_x,
+                                            float radius_y,
+                                            float margin)
+{
+    float x;
+    float y;
+    pair_frame_point(layout, frame, local_x, local_y, &x, &y);
+    float half_x = fabsf(frame->ux) * radius_x + fabsf(frame->vx) * radius_y + margin;
+    float half_y = fabsf(frame->uy) * radius_x + fabsf(frame->vy) * radius_y + margin;
+    area_include_rect(area, x - half_x, y - half_y, x + half_x, y + half_y);
+}
+
 static void draw_screen(app_face_canvas_t *canvas,
                         uint32_t now_ms,
                         const app_face_mood_numbers_t *mood,
@@ -883,7 +973,6 @@ static void draw_screen(app_face_canvas_t *canvas,
     float cx = layout->cx;
     float cy = layout->cy;
     float radius = layout->radius;
-    float face_motion_y = layout->face_motion_y;
     float eye_w = layout->eye_w;
     float eye_h = layout->eye_h;
     const app_face_surface_t *left = &layout->left;
@@ -901,26 +990,58 @@ static void draw_screen(app_face_canvas_t *canvas,
     }
 
     if (mood->think_dots > 0.05f) {
+        app_face_pair_frame_t frame = eye_pair_frame(layout);
+        float alpha = (0.46f + 0.16f * energy->lively) * mood->think_dots * frame.visibility;
+        float dot_y_base = -layout->local_h * 1.08f;
+        float dot_step = layout->sep * 0.42f;
         for (int i = 0; i < 3; i++) {
             float phase = s_face.time_s * (2.4f + energy->raw * 2.2f) + (float)i * 1.1f;
-            float dot_x = cx + radius * (-0.18f + (float)i * 0.18f);
-            float dot_y = cy - radius * 0.52f + face_motion_y + sinf(phase) * radius * 0.015f;
-            app_face_canvas_fill_ellipse(canvas, dot_x, dot_y, radius * (0.025f + (float)i * 0.004f), radius * (0.025f + (float)i * 0.004f), 0.0f, iris,
-                                         alpha_from_float((0.46f + 0.16f * energy->lively) * mood->think_dots));
+            float local_x = ((float)i - 1.0f) * dot_step;
+            float local_y = dot_y_base + sinf(phase) * radius * 0.015f;
+            float dot_x;
+            float dot_y;
+            float dot_r = radius * (0.025f + (float)i * 0.004f);
+            pair_frame_point(layout, &frame, local_x, local_y, &dot_x, &dot_y);
+            app_face_canvas_fill_transformed_ellipse(canvas,
+                                                     dot_x,
+                                                     dot_y,
+                                                     frame.ux,
+                                                     frame.uy,
+                                                     frame.vx,
+                                                     frame.vy,
+                                                     dot_r,
+                                                     dot_r,
+                                                     iris,
+                                                     alpha_from_float(alpha));
         }
     }
 
     if (mood->speaking_bars > 0.08f) {
+        app_face_pair_frame_t frame = eye_pair_frame(layout);
         int count = 7;
-        float total = radius * 0.56f;
-        float start = cx - total * 0.5f;
+        float total = layout->sep * 1.36f;
+        float start = -total * 0.5f;
+        float local_y = layout->local_h * 1.28f;
+        float alpha = (0.26f + 0.38f * energy->lively) * mood->speaking_bars * frame.visibility;
         for (int i = 0; i < count; i++) {
             float amp = fabsf(sinf(s_face.time_s * (7.0f + energy->raw * 18.0f) + (float)i * 0.72f)) *
                             radius * (0.05f + 0.13f * energy->lively) +
                         radius * 0.02f;
-            float x = start + (float)i * (total / (float)(count - 1));
-            app_face_canvas_fill_ellipse(canvas, x, cy + radius * 0.50f + face_motion_y, radius * 0.018f, amp * 0.5f, 0.0f, iris,
-                                         alpha_from_float((0.26f + 0.38f * energy->lively) * mood->speaking_bars));
+            float bar_x;
+            float bar_y;
+            float local_x = start + (float)i * (total / (float)(count - 1));
+            pair_frame_point(layout, &frame, local_x, local_y, &bar_x, &bar_y);
+            app_face_canvas_fill_transformed_ellipse(canvas,
+                                                     bar_x,
+                                                     bar_y,
+                                                     frame.ux,
+                                                     frame.uy,
+                                                     frame.vx,
+                                                     frame.vy,
+                                                     radius * 0.018f,
+                                                     amp * 0.5f,
+                                                     iris,
+                                                     alpha_from_float(alpha));
         }
     }
 
@@ -996,12 +1117,21 @@ static void estimate_dynamic_list(const app_face_canvas_t *canvas,
     }
 
     if (mood->think_dots > 0.05f) {
+        app_face_pair_frame_t frame = eye_pair_frame(layout);
         area_reset(&area, canvas->width, canvas->height);
-        area_include_rect(&area,
-                          layout->cx - layout->radius * 0.28f,
-                          layout->cy - layout->radius * 0.62f + layout->face_motion_y,
-                          layout->cx + layout->radius * 0.28f,
-                          layout->cy - layout->radius * 0.42f + layout->face_motion_y);
+        float dot_y_base = -layout->local_h * 1.08f;
+        float dot_step = layout->sep * 0.42f;
+        for (int i = 0; i < 3; i++) {
+            float dot_r = layout->radius * (0.025f + (float)i * 0.004f);
+            area_include_pair_frame_ellipse(&area,
+                                            layout,
+                                            &frame,
+                                            ((float)i - 1.0f) * dot_step,
+                                            dot_y_base,
+                                            dot_r,
+                                            dot_r + layout->radius * 0.018f,
+                                            4.0f);
+        }
         area_inflate_clip(&area, 6, canvas->width, canvas->height);
         if (clip_area_to_area(&area, &display_area, canvas->width, canvas->height)) {
             dirty_list_add_area(list, area, canvas->width, canvas->height);
@@ -1009,13 +1139,23 @@ static void estimate_dynamic_list(const app_face_canvas_t *canvas,
     }
 
     if (mood->speaking_bars > 0.08f) {
+        app_face_pair_frame_t frame = eye_pair_frame(layout);
         area_reset(&area, canvas->width, canvas->height);
+        float total = layout->sep * 1.36f;
+        float start = -total * 0.5f;
+        float local_y = layout->local_h * 1.28f;
         float amp = layout->radius * (0.06f + 0.15f * energy->lively);
-        area_include_rect(&area,
-                          layout->cx - layout->radius * 0.34f,
-                          layout->cy + layout->radius * 0.50f + layout->face_motion_y - amp,
-                          layout->cx + layout->radius * 0.34f,
-                          layout->cy + layout->radius * 0.50f + layout->face_motion_y + amp);
+        for (int i = 0; i < 7; i++) {
+            float local_x = start + (float)i * (total / 6.0f);
+            area_include_pair_frame_ellipse(&area,
+                                            layout,
+                                            &frame,
+                                            local_x,
+                                            local_y,
+                                            layout->radius * 0.022f,
+                                            amp * 0.55f,
+                                            4.0f);
+        }
         area_inflate_clip(&area, 6, canvas->width, canvas->height);
         if (clip_area_to_area(&area, &display_area, canvas->width, canvas->height)) {
             dirty_list_add_area(list, area, canvas->width, canvas->height);
