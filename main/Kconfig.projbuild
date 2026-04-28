@@ -49,6 +49,23 @@ menu "Example Configuration"
         default y
         depends on APP_FACE_ENABLED
 
+    config APP_MOTION_LOG_ENABLED
+        bool "Log QMI8658 motion calibration samples"
+        default y
+        depends on APP_FACE_USE_IMU
+
+    config APP_MOTION_LOG_INTERVAL_MS
+        int "Motion calibration log interval"
+        range 100 5000
+        default 500
+        depends on APP_MOTION_LOG_ENABLED
+
+    config APP_MOTION_ROLL_GYRO_SIGN
+        int "Gyro Z sign for face roll"
+        range -1 1
+        default 1
+        depends on APP_FACE_USE_IMU
+
     config APP_FACE_TOUCH_START_ENABLED
         bool "Use screen taps as primary assistant action"
         default y

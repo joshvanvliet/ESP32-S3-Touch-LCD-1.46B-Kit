@@ -79,6 +79,8 @@ typedef struct {
 
 typedef struct {
     float scale;
+    float display_cx;
+    float display_cy;
     float cx;
     float cy;
     float radius;
@@ -516,14 +518,22 @@ static app_face_orientation_t orientation3d(const app_face_mood_numbers_t *mood,
     };
 }
 
+static float normalized_center(float size, float value)
+{
+    if (value > 0.0f && value < 1.0f) {
+        return size * value;
+    }
+    return size * 0.5f;
+}
+
 static void draw_static_screen(app_face_canvas_t *canvas)
 {
     const app_face_geometry_config_t *geo = &APP_FACE_DEFAULT_CONFIG.geometry;
     float w = (float)canvas->width;
     float h = (float)canvas->height;
     float scale = fminf(w, h);
-    float cx = w * 0.5f;
-    float cy = h * 0.5f;
+    float cx = normalized_center(w, geo->display_center_x);
+    float cy = normalized_center(h, geo->display_center_y);
     float radius = scale * geo->display_radius;
     app_face_rgb_t screen = {.r = 3, .g = 5, .b = 9};
     app_face_rgb_t inner = {.r = 5, .g = 8, .b = 13};
@@ -560,22 +570,31 @@ static float projected_radial_half(const app_face_surface_t *surface, float loca
     return (fabsf(u_radial) * local_w + fabsf(v_radial) * local_h) * 0.54f;
 }
 
-static void keep_surface_inside_display(app_face_surface_t *surface, float display_radius, float local_w, float local_h)
+static void keep_surface_inside_display(app_face_surface_t *surface,
+                                        float display_radius,
+                                        float local_w,
+                                        float local_h,
+                                        float face_to_display_x,
+                                        float face_to_display_y)
 {
     const app_face_geometry_config_t *geo = &APP_FACE_DEFAULT_CONFIG.geometry;
-    float center_dist = sqrtf(surface->x * surface->x + surface->y * surface->y);
+    float display_x = face_to_display_x + surface->x;
+    float display_y = face_to_display_y + surface->y;
+    float center_dist = sqrtf(display_x * display_x + display_y * display_y);
     if (center_dist < 0.0001f) {
         return;
     }
 
-    float radial_half = projected_radial_half(surface, local_w, local_h);
+    app_face_surface_t display_surface = *surface;
+    display_surface.x = display_x;
+    display_surface.y = display_y;
+    float radial_half = projected_radial_half(&display_surface, local_w, local_h);
     float safe_edge = display_radius * (1.0f - geo->projected_eye_edge_margin);
     float max_center_dist = fmaxf(display_radius * 0.12f, safe_edge - radial_half);
     if (center_dist > max_center_dist) {
         float fit = max_center_dist / center_dist;
-        surface->x *= fit;
-        surface->y *= fit;
-        center_dist = max_center_dist;
+        surface->x = display_x * fit - face_to_display_x;
+        surface->y = display_y * fit - face_to_display_y;
     }
 
     if (surface->z > -0.10f) {
@@ -770,8 +789,10 @@ static void compute_draw_layout(const app_face_canvas_t *canvas,
     float w = (float)canvas->width;
     float h = (float)canvas->height;
     float scale = fminf(w, h);
-    float cx = w * 0.5f;
-    float cy = h * 0.5f;
+    float display_cx = normalized_center(w, geo->display_center_x);
+    float display_cy = normalized_center(h, geo->display_center_y);
+    float cx = normalized_center(w, geo->face_center_x);
+    float cy = normalized_center(h, geo->face_center_y);
     float radius = scale * geo->display_radius;
     float nod = mood->nod * sinf(s_face.time_s * (APP_FACE_DEFAULT_CONFIG.motion.nod_frequency_base +
                                                   energy->raw * APP_FACE_DEFAULT_CONFIG.motion.nod_frequency_energy));
@@ -822,6 +843,8 @@ static void compute_draw_layout(const app_face_canvas_t *canvas,
     float patch_h = local_h * geo->patch_scale;
 
     layout->scale = scale;
+    layout->display_cx = display_cx;
+    layout->display_cy = display_cy;
     layout->cx = cx;
     layout->cy = cy;
     layout->radius = radius;
@@ -836,8 +859,10 @@ static void compute_draw_layout(const app_face_canvas_t *canvas,
     layout->patch_h = patch_h;
     layout->left = app_face_eye_surface(-sep + gaze_offset_x, base_y + gaze_offset_y, patch_w, patch_h, sphere_radius, radius, orientation);
     layout->right = app_face_eye_surface(sep + gaze_offset_x, base_y + gaze_offset_y, patch_w, patch_h, sphere_radius, radius, orientation);
-    keep_surface_inside_display(&layout->left, radius - 2.0f, eye_w, local_h);
-    keep_surface_inside_display(&layout->right, radius - 2.0f, eye_w, local_h);
+    float face_to_display_x = cx - display_cx;
+    float face_to_display_y = cy - display_cy;
+    keep_surface_inside_display(&layout->left, radius - 2.0f, eye_w, local_h, face_to_display_x, face_to_display_y);
+    keep_surface_inside_display(&layout->right, radius - 2.0f, eye_w, local_h, face_to_display_x, face_to_display_y);
     layout->look_x = fabsf(s_face.axis_x) + fabsf(s_face.axis_y) > 0.08f ? s_face.axis_x : 0.0f;
     layout->look_y = app_face_clampf((fabsf(s_face.axis_x) + fabsf(s_face.axis_y) > 0.08f ? s_face.axis_y : 0.0f) -
                                          mood->think_dots * 0.28f,
@@ -865,7 +890,7 @@ static void draw_screen(app_face_canvas_t *canvas,
     const app_face_surface_t *right = &layout->right;
     float look_x = layout->look_x;
     float look_y = layout->look_y;
-    app_face_canvas_set_clip_circle(canvas, cx, cy, radius - 2.0f);
+    app_face_canvas_set_clip_circle(canvas, layout->display_cx, layout->display_cy, radius - 2.0f);
 
     if (left->z <= right->z) {
         draw_eye(canvas, cx, cy, left, -1, mood, iris, pupil, eye_w, eye_h, look_x, look_y, scale);
@@ -928,10 +953,10 @@ static lv_area_t display_dirty_area(const app_face_canvas_t *canvas, const app_f
 {
     float display_margin = 4.0f;
     lv_area_t area = {
-        .x1 = (lv_coord_t)floorf(layout->cx - layout->radius - display_margin),
-        .y1 = (lv_coord_t)floorf(layout->cy - layout->radius - display_margin),
-        .x2 = (lv_coord_t)ceilf(layout->cx + layout->radius + display_margin),
-        .y2 = (lv_coord_t)ceilf(layout->cy + layout->radius + display_margin),
+        .x1 = (lv_coord_t)floorf(layout->display_cx - layout->radius - display_margin),
+        .y1 = (lv_coord_t)floorf(layout->display_cy - layout->radius - display_margin),
+        .x2 = (lv_coord_t)ceilf(layout->display_cx + layout->radius + display_margin),
+        .y2 = (lv_coord_t)ceilf(layout->display_cy + layout->radius + display_margin),
     };
     area_clip_to_bounds(&area, canvas->width, canvas->height);
     return area;

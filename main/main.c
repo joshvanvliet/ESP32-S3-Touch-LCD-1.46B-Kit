@@ -24,7 +24,7 @@ static void driver_loop(void *parameter)
     while (1) {
         PWR_Loop();
         QMI8658_Loop();
-        app_motion_update_from_accel(Accel.x, Accel.y, Accel.z);
+        app_motion_update_from_imu(Accel.x, Accel.y, Accel.z, Gyro.x, Gyro.y, Gyro.z);
 
         slow_div++;
         if (slow_div >= 5) {

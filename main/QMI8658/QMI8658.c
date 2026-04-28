@@ -61,6 +61,7 @@ void QMI8658_Init(void)
 void QMI8658_Loop(void)
 {
   getAccelerometer();
+  getGyroscope();
 }
 
 /**
@@ -284,7 +285,6 @@ void getGyroscope(void)
     Gyro.y = Gyro.y * gyroScales;
     Gyro.z = Gyro.z * gyroScales;
 }
-
 
 
 

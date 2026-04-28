@@ -69,6 +69,10 @@ typedef struct {
     uint16_t render_width;
     uint16_t render_height;
     uint16_t fps;
+    float display_center_x;
+    float display_center_y;
+    float face_center_x;
+    float face_center_y;
     float display_radius;
     float sphere_radius;
     float eye_width_scale;
