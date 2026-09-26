@@ -4,7 +4,6 @@
 static const char *TAG = "AUDIO PCM5101"; 
 
 static i2s_chan_handle_t i2s_tx_chan; 
-static i2s_chan_handle_t i2s_rx_chan; 
 static uint32_t s_pcm_tx_rate_hz;
 static bool s_pcm_tx_stereo_mode;
 static SemaphoreHandle_t s_tx_mutex;
@@ -183,7 +182,10 @@ void Audio_Init(void)
         .slot_cfg = I2S_STD_PHILIP_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = BSP_I2S_GPIO_CFG,
     };
-    esp_err_t ret = bsp_audio_init(&std_cfg, &i2s_tx_chan, &i2s_rx_chan);
+    /* PCM5101 is output-only (DIN is not connected). Allocating an RX channel
+     * here wastes DMA buffers and runs unused receive DMA continuously.
+     * Microphone capture and WakeNet own their separate I2S1 RX channel. */
+    esp_err_t ret = bsp_audio_init(&std_cfg, &i2s_tx_chan, NULL);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize audio: %s", esp_err_to_name(ret));
         return;

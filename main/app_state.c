@@ -4,6 +4,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/task.h"
 
 #include "PWR_Key.h"
 #include "app_audio_capture.h"
@@ -72,6 +73,7 @@ typedef struct {
 
 static const char *TAG = "APP_STATE";
 static QueueHandle_t s_event_queue;
+static TaskHandle_t s_process_task;
 static app_runtime_t s_rt;
 static portMUX_TYPE s_level_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint16_t s_latest_level;
@@ -150,7 +152,11 @@ static bool app_state_post(app_event_t ev)
     if (!s_event_queue) {
         return false;
     }
-    return xQueueSend(s_event_queue, &ev, 0) == pdTRUE;
+    if (xQueueSend(s_event_queue, &ev, 0) != pdTRUE) return false;
+    /* Notifications are retained if the consumer is rendering right now, so
+     * an event cannot be lost between draining the queue and going to sleep. */
+    xTaskNotifyGive(s_process_task);
+    return true;
 }
 
 #if CONFIG_APP_WAKEWORD_ENABLED
@@ -737,6 +743,7 @@ static void app_state_handle_event(const app_event_t *ev)
 
 esp_err_t app_state_init(void)
 {
+    s_process_task = xTaskGetCurrentTaskHandle();
     memset(&s_rt, 0, sizeof(s_rt));
     s_rt.state = APP_STATE_UNPAIRED;
     s_latest_level = 0;
@@ -829,6 +836,13 @@ esp_err_t app_state_init(void)
 
     ESP_LOGI(TAG, "App state initialized");
     return ESP_OK;
+}
+
+void app_state_wait(uint32_t timeout_ms)
+{
+    TickType_t ticks = pdMS_TO_TICKS(timeout_ms);
+    if (!ticks) ticks = 1;
+    (void)ulTaskNotifyTake(pdTRUE, ticks);
 }
 
 void app_state_process(void)

@@ -10,11 +10,13 @@ lv_disp_draw_buf_t disp_buf;                                                 // 
 lv_disp_drv_t disp_drv;                                                      // contains callback functions
 lv_indev_drv_t indev_drv;
 
+#if !LV_TICK_CUSTOM
 void example_increase_lvgl_tick(void *arg)
 {
     /* Tell LVGL how many milliseconds has elapsed */
     lv_tick_inc(EXAMPLE_LVGL_TICK_PERIOD_MS);
 }
+#endif
 void Lvgl_port_rounder_callback(struct _lv_disp_drv_t * disp_drv, lv_area_t * area)
 {
   uint16_t x1 = area->x1;
@@ -134,6 +136,7 @@ void LVGL_Init(void)
     lv_indev_drv_register( &indev_drv );
 
     /********************* LVGL *********************/
+#if !LV_TICK_CUSTOM
     ESP_LOGI(TAG_LVGL, "Install LVGL tick timer");
     // Tick interface for LVGL (using esp_timer to generate 2ms periodic event)
     const esp_timer_create_args_t lvgl_tick_timer_args = {
@@ -144,5 +147,8 @@ void LVGL_Init(void)
     esp_timer_handle_t lvgl_tick_timer = NULL;
     ESP_ERROR_CHECK(esp_timer_create(&lvgl_tick_timer_args, &lvgl_tick_timer));
     ESP_ERROR_CHECK(esp_timer_start_periodic(lvgl_tick_timer, EXAMPLE_LVGL_TICK_PERIOD_MS * 1000));
+#else
+    ESP_LOGI(TAG_LVGL, "Use monotonic clock for LVGL (no tick timer)");
+#endif
 
 }

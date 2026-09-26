@@ -23,6 +23,7 @@ idf_component_register(
         "./MIC_Driver/MIC_Speech.c"
         "./LCD_Driver/esp_lcd_spd2010/esp_lcd_spd2010.c"
         "./LCD_Driver/Display_SPD2010.c"
+        "./LCD_Driver/app_lcd_qspi_io.c"
         "./Touch_Driver/Touch_SPD2010.c"
         "./LVGL_Driver/LVGL_Driver.c"
         "./SD_Card/SD_MMC.c"
@@ -53,6 +54,7 @@ idf_component_register(
         "bt"
         "spi_flash"
     PRIV_REQUIRES
+        "esp_pm"
         "esp_audio_codec"
         "nvs_flash"
 )

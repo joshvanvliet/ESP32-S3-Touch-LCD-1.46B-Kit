@@ -1,6 +1,7 @@
 #include "Display_SPD2010.h"
 
 #include "app_lcd.h"
+#include "app_lcd_qspi_io.h"
 
 static const char *TAG_LCD = "SPD2010";
 
@@ -18,21 +19,23 @@ void LCD_Init() {
   Touch_Init();
 }
 
-static void test_draw_bitmap(esp_lcd_panel_handle_t panel_handle)
+static void test_draw_bitmap(void)
 {
   uint16_t row_line = ((EXAMPLE_LCD_WIDTH / EXAMPLE_LCD_COLOR_BITS) << 1) >> 1;
   uint8_t byte_per_pixel = EXAMPLE_LCD_COLOR_BITS / 8;
   uint8_t *color = (uint8_t *)heap_caps_calloc(1, row_line * EXAMPLE_LCD_HEIGHT * byte_per_pixel, MALLOC_CAP_DMA);
-
+  if (!color) return;
 
   for (int j = 0; j < EXAMPLE_LCD_COLOR_BITS; j++) {
+      ESP_ERROR_CHECK(app_lcd_wait_idle(UINT32_MAX));
       for (int i = 0; i < row_line * EXAMPLE_LCD_HEIGHT; i++) {
           for (int k = 0; k < byte_per_pixel; k++) {
               color[i * byte_per_pixel + k] = (SPI_SWAP_DATA_TX(BIT(j), EXAMPLE_LCD_COLOR_BITS) >> (k * 8)) & 0xff;
           }
       }
-      esp_lcd_panel_draw_bitmap(panel_handle, 0, j * row_line, EXAMPLE_LCD_HEIGHT, (j + 1) * row_line, color);
+      ESP_ERROR_CHECK(app_lcd_blit_rect_async(0, j * row_line, EXAMPLE_LCD_HEIGHT, row_line, color, NULL, NULL));
   }
+  ESP_ERROR_CHECK(app_lcd_wait_idle(UINT32_MAX));
   free(color);
 }
 
@@ -77,8 +80,9 @@ int QSPI_Init(void){
     },                                  
   };
   esp_lcd_panel_io_handle_t io_handle = NULL;
-  if(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)ESP_PANEL_HOST_SPI_ID_DEFAULT, &io_config, &io_handle) != ESP_OK){
-    printf("Failed to set LCD communication parameters -- SPI\r\n");
+  esp_err_t io_err = app_lcd_new_qspi_io(ESP_PANEL_HOST_SPI_ID_DEFAULT, &io_config, &io_handle);
+  if(io_err != ESP_OK){
+    ESP_LOGE(TAG_LCD, "Failed to configure LCD QSPI: %s", esp_err_to_name(io_err));
     return 0;
   }
   printf("LCD communication parameters are set successfully -- SPI\r\n");
@@ -107,7 +111,8 @@ int QSPI_Init(void){
   // esp_lcd_panel_invert_color(panel_handle,false);
 
   esp_lcd_panel_disp_on_off(panel_handle, true);
-  test_draw_bitmap(panel_handle);
+  ESP_ERROR_CHECK(app_lcd_te_init(ESP_PANEL_LCD_SPI_IO_TE));
+  test_draw_bitmap();
   return 1;
 }
 

@@ -3,6 +3,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "portmacro.h"
+#include "driver/gpio.h"
+#include "esp_timer.h"
+#include "esp_log.h"
+#include "sdkconfig.h"
 
 static esp_lcd_panel_handle_t s_panel;
 static SemaphoreHandle_t s_idle_sem;
@@ -10,6 +14,93 @@ static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static app_lcd_blit_done_cb_t s_done_cb;
 static void *s_done_user;
 static bool s_transfer_active;
+static SemaphoreHandle_t s_te_sem;
+static int64_t s_te_time_us;
+static uint32_t s_te_period_us;
+#if CONFIG_APP_FACE_PROFILE
+static int64_t s_frame_edge_us;
+static uint32_t s_frame_wake_delay_us;
+#endif
+
+static void lcd_te_isr(void *arg)
+{
+    (void)arg;
+    int64_t now_us = esp_timer_get_time();
+    portENTER_CRITICAL_ISR(&s_lock);
+    s_te_period_us = (uint32_t)(now_us - s_te_time_us);
+    s_te_time_us = now_us;
+    portEXIT_CRITICAL_ISR(&s_lock);
+    BaseType_t woken = pdFALSE;
+    xSemaphoreGiveFromISR(s_te_sem, &woken);
+    if (woken) portYIELD_FROM_ISR();
+}
+
+esp_err_t app_lcd_te_init(int gpio_num)
+{
+    if (s_te_sem) return ESP_OK;
+    s_te_sem = xSemaphoreCreateBinary();
+    if (!s_te_sem) return ESP_ERR_NO_MEM;
+    gpio_config_t config = {
+        .pin_bit_mask = 1ULL << gpio_num,
+        .mode = GPIO_MODE_INPUT,
+        .intr_type = GPIO_INTR_POSEDGE,
+    };
+    esp_err_t err = gpio_config(&config);
+    if (err == ESP_OK) {
+        err = gpio_install_isr_service(0);
+        if (err == ESP_ERR_INVALID_STATE) err = ESP_OK;
+    }
+    if (err == ESP_OK) err = gpio_isr_handler_add(gpio_num, lcd_te_isr, NULL);
+    if (err != ESP_OK) {
+        vSemaphoreDelete(s_te_sem);
+        s_te_sem = NULL;
+    } else {
+        ESP_LOGI("LCD_TE", "Panel refresh synchronization on GPIO%d", gpio_num);
+    }
+    return err;
+}
+
+esp_err_t app_lcd_wait_frame_start(uint32_t timeout_ms)
+{
+    if (!s_te_sem) return ESP_ERR_INVALID_STATE;
+    esp_err_t err = app_lcd_wait_idle(timeout_ms);
+    if (err != ESP_OK) return err;
+    /* Discard the edge from the preceding refresh while the CPU was drawing. */
+    xSemaphoreTake(s_te_sem, 0);
+    if (xSemaphoreTake(s_te_sem, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        ESP_LOGW("LCD_TE", "Timed out waiting for panel refresh");
+        return ESP_ERR_TIMEOUT;
+    }
+#if CONFIG_APP_FACE_PROFILE
+    portENTER_CRITICAL(&s_lock);
+    s_frame_edge_us = s_te_time_us;
+    portEXIT_CRITICAL(&s_lock);
+    s_frame_wake_delay_us = (uint32_t)(esp_timer_get_time() - s_frame_edge_us);
+#endif
+    return ESP_OK;
+}
+
+esp_err_t app_lcd_finish_frame(uint32_t timeout_ms)
+{
+    esp_err_t err = app_lcd_wait_idle(timeout_ms);
+#if CONFIG_APP_FACE_PROFILE
+    static uint32_t frames, wake_max_us, present_max_us;
+    uint32_t present_us = (uint32_t)(esp_timer_get_time() - s_frame_edge_us);
+    if (present_us > present_max_us) present_max_us = present_us;
+    if (s_frame_wake_delay_us > wake_max_us) wake_max_us = s_frame_wake_delay_us;
+    if (++frames == 60) {
+        portENTER_CRITICAL(&s_lock);
+        uint32_t period_us = s_te_period_us;
+        portEXIT_CRITICAL(&s_lock);
+        /* Log after DMA completes, never inside the scan-out head start. */
+        ESP_LOGI("LCD_TE", "frames=%lu period_us=%lu wake_max_us=%lu present_max_us=%lu",
+                 (unsigned long)frames, (unsigned long)period_us,
+                 (unsigned long)wake_max_us, (unsigned long)present_max_us);
+        frames = wake_max_us = present_max_us = 0;
+    }
+#endif
+    return err;
+}
 
 esp_err_t app_lcd_init(esp_lcd_panel_handle_t panel)
 {

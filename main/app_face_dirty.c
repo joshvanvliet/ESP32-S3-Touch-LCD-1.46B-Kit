@@ -157,6 +157,14 @@ void app_face_dirty_list_add_area(app_face_dirty_list_t *list, lv_area_t area, i
 
     for (size_t i = 0; i < list->count; i++) {
         if (area_near_or_overlaps(&list->rects[i], &area, APP_FACE_DIRTY_MERGE_GAP)) {
+            /* Touching diagonal bounds can make a mostly empty bounding box.
+             * Keep them separate when merging would increase pixel work. */
+            lv_area_t merged = list->rects[i];
+            app_face_area_include_area(&merged, &area);
+            if (app_face_area_pixel_count(&merged) >
+                app_face_area_pixel_count(&list->rects[i]) + app_face_area_pixel_count(&area)) {
+                continue;
+            }
             app_face_area_include_area(&list->rects[i], &area);
             app_face_area_clip_to_bounds(&list->rects[i], width, height);
             return;

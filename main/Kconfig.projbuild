@@ -41,14 +41,21 @@ menu "Example Configuration"
     config APP_FACE_TX_BUFFER_BYTES
         int "Animated face LCD transfer buffer bytes"
         range 4096 32768
-        default 8192
+        default 8240
         depends on APP_FACE_ENABLED
+        help
+            8240 bytes holds ten complete 412-pixel RGB565 rows. Two buffers
+            use 16480 bytes, reducing DMA wakeups while retaining room for BLE
+            and speech tasks with the output-only speaker I2S configuration.
 
     config APP_FACE_TX_BUFFER_COUNT
         int "Animated face LCD transfer buffer count"
         range 1 2
-        default 1
+        default 2
         depends on APP_FACE_ENABLED
+        help
+            Two buffers overlap framebuffer packing with the previous LCD DMA
+            transfer. One buffer uses less internal RAM but serializes both.
 
     config APP_FACE_USE_IMU
         bool "Drive animated assistant face from QMI8658 tilt"

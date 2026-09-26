@@ -19,6 +19,9 @@ typedef struct {
     int framebuffer_width;
     int framebuffer_height;
     lv_color_t **tx_buffers;
+    /* Persistent ring cursor, shared across dirty regions and frames. Buffers
+     * must be distinct and exclusively owned by this producer until LCD idle.
+     * With no cursor, packing safely falls back to a single buffer. */
     uint8_t *tx_index;
     size_t tx_buffer_bytes;
     size_t tx_buffer_count;

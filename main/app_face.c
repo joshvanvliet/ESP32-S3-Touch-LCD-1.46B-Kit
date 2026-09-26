@@ -7,6 +7,7 @@
 #include "Display_SPD2010.h"
 #include "app_face_canvas.h"
 #include "app_face_blit.h"
+#include "app_lcd.h"
 #include "app_face_dirty.h"
 #include "app_face_math.h"
 #include "app_motion.h"
@@ -14,6 +15,12 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "sdkconfig.h"
+#ifdef ESP_PLATFORM
+#include "freertos/task.h"
+#endif
+#if CONFIG_PM_ENABLE
+#include "esp_pm.h"
+#endif
 
 #ifndef CONFIG_APP_FACE_FPS
 #define CONFIG_APP_FACE_FPS 60
@@ -24,11 +31,11 @@
 #endif
 
 #ifndef CONFIG_APP_FACE_TX_BUFFER_BYTES
-#define CONFIG_APP_FACE_TX_BUFFER_BYTES 8192
+#define CONFIG_APP_FACE_TX_BUFFER_BYTES 8240
 #endif
 
 #ifndef CONFIG_APP_FACE_TX_BUFFER_COUNT
-#define CONFIG_APP_FACE_TX_BUFFER_COUNT 1
+#define CONFIG_APP_FACE_TX_BUFFER_COUNT 2
 #endif
 
 #if !CONFIG_APP_FACE_ENABLED
@@ -45,12 +52,16 @@ void app_face_set_axes(float axis_x, float axis_y, float axis_z) { (void)axis_x;
 void app_face_force_blink(void) {}
 void app_face_tap(void) {}
 void app_face_tick(uint32_t now_ms) { (void)now_ms; }
+uint32_t app_face_next_frame_delay_ms(void) { return UINT32_MAX; }
 void app_face_set_protected_areas(const lv_area_t *areas, size_t count) { (void)areas; (void)count; }
 void app_face_request_full_refresh(void) {}
 bool app_face_get_stats(app_face_stats_t *out_stats) { (void)out_stats; return false; }
 #else
 
 static const char *TAG = "APP_FACE";
+#if CONFIG_PM_ENABLE
+static esp_pm_lock_handle_t s_render_cpu_lock;
+#endif
 
 #define APP_FACE_TX_BUFFER_BYTES CONFIG_APP_FACE_TX_BUFFER_BYTES
 #define APP_FACE_TX_BUFFER_COUNT CONFIG_APP_FACE_TX_BUFFER_COUNT
@@ -198,6 +209,7 @@ typedef struct {
     uint32_t stats_packed_bytes;
     uint32_t stats_dirty_rects;
     uint32_t stats_lcd_chunks;
+    uint32_t stats_render_time_us;
     uint32_t stats_restore_time_us;
     uint32_t stats_draw_time_us;
     uint32_t stats_pack_time_us;
@@ -1185,6 +1197,7 @@ static void update_stats(uint32_t now_ms,
     }
 
     s_face.stats_rendered_frames++;
+    s_face.stats_render_time_us += render_time_us;
     if (blitted) {
         s_face.stats_blit_frames++;
     }
@@ -1216,7 +1229,7 @@ static void update_stats(uint32_t now_ms,
         s_face.stats.full_refresh_count = s_face.stats_full_refreshes;
 #if CONFIG_APP_FACE_PROFILE
         ESP_LOGI(TAG,
-                 "face target=%lu render=%lu blit=%lu render_us=%lu restore_us=%lu draw_us=%lu pack_us=%lu dirty_px=%lu dirty_rects=%lu chunks=%lu packed=%lu wait_us=%lu full=%lu skipped=%lu",
+                 "face target=%lu render=%lu blit=%lu render_us=%lu restore_us=%lu draw_us=%lu pack_us=%lu dirty_px=%lu dirty_rects=%lu chunks=%lu packed=%lu wait_us=%lu full=%lu skipped=%lu frames=%lu render_avg_us=%lu",
                  (unsigned long)s_face.stats.target_fps,
                  (unsigned long)s_face.stats.rendered_fps,
                  (unsigned long)s_face.stats.blit_fps,
@@ -1230,7 +1243,9 @@ static void update_stats(uint32_t now_ms,
                  (unsigned long)s_face.stats.packed_bytes,
                  (unsigned long)s_face.stats.lcd_wait_time_us,
                  (unsigned long)s_face.stats.full_refresh_count,
-                 (unsigned long)s_face.stats.skipped_frames);
+                 (unsigned long)s_face.stats.skipped_frames,
+                 (unsigned long)s_face.stats_rendered_frames,
+                 (unsigned long)(s_face.stats_render_time_us / s_face.stats_rendered_frames));
 #endif
         s_face.stats_window_start_ms = now_ms;
         s_face.stats_rendered_frames = 0;
@@ -1240,6 +1255,7 @@ static void update_stats(uint32_t now_ms,
         s_face.stats_packed_bytes = 0;
         s_face.stats_dirty_rects = 0;
         s_face.stats_lcd_chunks = 0;
+        s_face.stats_render_time_us = 0;
         s_face.stats_restore_time_us = 0;
         s_face.stats_draw_time_us = 0;
         s_face.stats_pack_time_us = 0;
@@ -1352,29 +1368,9 @@ static void render(uint32_t now_ms)
     uint32_t restore_time_us = 0;
     uint32_t draw_time_us = 0;
     bool blitted = false;
+    bool blit_failed = false;
 
-    if (s_face.base_pixels) {
-        for (size_t i = 0; i < dirty_list.count; i++) {
-            lv_area_t area = dirty_list.rects[i];
-            if (!area_clip_to_bounds(&area, s_face.canvas.width, s_face.canvas.height)) {
-                continue;
-            }
-            int64_t restore_start = esp_timer_get_time();
-            app_face_canvas_restore_region(&s_face.canvas,
-                                           &s_face.base_canvas,
-                                           area.x1,
-                                           area.y1,
-                                           area.x2,
-                                           area.y2);
-            restore_time_us += (uint32_t)(esp_timer_get_time() - restore_start);
-            int64_t draw_start = esp_timer_get_time();
-            app_face_canvas_set_clip_rect(&s_face.canvas, area.x1, area.y1, area.x2, area.y2);
-            app_face_canvas_set_clip_circle(&s_face.canvas, layout.display_cx, layout.display_cy, layout.radius - 2.0f);
-            draw_render_plan(&s_face.canvas, &render_plan, &area);
-            app_face_canvas_clear_clip(&s_face.canvas);
-            draw_time_us += (uint32_t)(esp_timer_get_time() - draw_start);
-        }
-    } else {
+    if (!s_face.base_pixels) {
         app_face_canvas_clear(&s_face.canvas, (app_face_rgb_t){.r = 1, .g = 2, .b = 5});
         int64_t draw_start = esp_timer_get_time();
         app_face_canvas_set_clip_circle(&s_face.canvas, layout.display_cx, layout.display_cy, layout.radius - 2.0f);
@@ -1395,17 +1391,82 @@ static void render(uint32_t now_ms)
         .protected_area_count = s_face.protected_area_count,
     };
     for (size_t i = 0; i < dirty_list.count; i++) {
-        esp_err_t err = app_face_blit_dirty_area(&blit_ctx, &dirty_list.rects[i], &blit_stats);
+        lv_area_t area = dirty_list.rects[i];
+        if (!area_clip_to_bounds(&area, s_face.canvas.width, s_face.canvas.height)) {
+            continue;
+        }
+        if (s_face.base_pixels) {
+            int64_t restore_start = esp_timer_get_time();
+            app_face_canvas_restore_region(&s_face.canvas,
+                                           &s_face.base_canvas,
+                                           area.x1, area.y1, area.x2, area.y2);
+            restore_time_us += (uint32_t)(esp_timer_get_time() - restore_start);
+            int64_t draw_start = esp_timer_get_time();
+            app_face_canvas_set_clip_rect(&s_face.canvas, area.x1, area.y1, area.x2, area.y2);
+            app_face_canvas_set_clip_circle(&s_face.canvas, layout.display_cx, layout.display_cy, layout.radius - 2.0f);
+            draw_render_plan(&s_face.canvas, &render_plan, &area);
+            app_face_canvas_clear_clip(&s_face.canvas);
+            draw_time_us += (uint32_t)(esp_timer_get_time() - draw_start);
+        }
+    }
+
+    /* Drawing between transfers lets the panel scan catch up with the writer.
+     * Prepare the complete frame first, then present from a fresh TE edge. */
+#ifdef ESP_PLATFORM
+    /* Only presentation is time-critical. DMA waits still yield to the audio
+     * tasks; the brief CPU copies must stay ahead of the panel's scan line. */
+    UBaseType_t saved_priority = uxTaskPriorityGet(NULL);
+    if (saved_priority < 6) vTaskPrioritySet(NULL, 6);
+#endif
+#if CONFIG_PM_ENABLE
+    if (s_render_cpu_lock) esp_pm_lock_release(s_render_cpu_lock);
+#endif
+    esp_err_t sync_err = app_lcd_wait_frame_start(34);
+#if CONFIG_PM_ENABLE
+    if (s_render_cpu_lock) esp_pm_lock_acquire(s_render_cpu_lock);
+#endif
+    if (sync_err != ESP_OK) {
+#ifdef ESP_PLATFORM
+        vTaskPrioritySet(NULL, saved_priority);
+#endif
+        s_face.full_refresh_requested = true;
+        return;
+    }
+    /* Interleave regions by their next scan line. Finishing an entire tall
+     * region before starting its neighbor can still tear near the top. Each
+     * strip fits one DMA buffer, keeping the writer ahead of panel scan-out. */
+    app_face_dirty_list_t pending = dirty_list;
+    while (true) {
+        size_t next = pending.count;
+        for (size_t i = 0; i < pending.count; i++) {
+            if (!area_is_empty(&pending.rects[i]) &&
+                (next == pending.count || pending.rects[i].y1 < pending.rects[next].y1)) next = i;
+        }
+        if (next == pending.count) break;
+        lv_area_t strip = pending.rects[next];
+        int rows = APP_FACE_TX_BUFFER_BYTES / (sizeof(lv_color_t) * area_width(&strip));
+        if (rows < 1) {
+            blit_failed = true;
+            break;
+        }
+        if (area_height(&strip) > rows) strip.y2 = strip.y1 + rows - 1;
+        pending.rects[next].y1 = strip.y2 + 1;
+        esp_err_t err = app_face_blit_dirty_area(&blit_ctx, &strip, &blit_stats);
         if (err == ESP_OK) {
             blitted = true;
         } else {
+            blit_failed = true;
             ESP_LOGW(TAG, "Face blit failed: %s", esp_err_to_name(err));
         }
     }
 
+    if (app_lcd_finish_frame(34) != ESP_OK) blit_failed = true;
+#ifdef ESP_PLATFORM
+    vTaskPrioritySet(NULL, saved_priority);
+#endif
     s_face.prev_dynamic_list = current_list;
     s_face.has_prev_dynamic_list = true;
-    s_face.full_refresh_requested = false;
+    s_face.full_refresh_requested = blit_failed;
 
     uint32_t render_time_us = (uint32_t)(esp_timer_get_time() - render_start_us);
     update_stats(now_ms,
@@ -1497,6 +1558,14 @@ esp_err_t app_face_init(lv_obj_t *parent)
     lv_obj_set_style_pad_all(s_face.canvas_obj, 0, 0);
     lv_obj_clear_flag(s_face.canvas_obj, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_face.canvas_obj, LV_OBJ_FLAG_CLICKABLE);
+#if CONFIG_PM_ENABLE
+    /* Avoid changing CPU frequency for every short DMA wait. Completing the
+     * whole frame at full speed creates a longer idle interval afterwards. */
+    if (!s_render_cpu_lock) {
+        esp_err_t err = esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "render", &s_render_cpu_lock);
+        if (err != ESP_OK) ESP_LOGW(TAG, "Render CPU lock unavailable: %s", esp_err_to_name(err));
+    }
+#endif
     s_face.initialized = true;
     ESP_LOGI(TAG,
              "Face renderer initialized %dx%d @ %d fps direct LCD, tx=%d bytes x %d",
@@ -1505,7 +1574,13 @@ esp_err_t app_face_init(lv_obj_t *parent)
              CONFIG_APP_FACE_FPS,
              APP_FACE_TX_BUFFER_BYTES,
              APP_FACE_TX_BUFFER_COUNT);
+#if CONFIG_PM_ENABLE
+    if (s_render_cpu_lock) esp_pm_lock_acquire(s_render_cpu_lock);
+#endif
     render(s_face.last_frame_ms);
+#if CONFIG_PM_ENABLE
+    if (s_render_cpu_lock) esp_pm_lock_release(s_render_cpu_lock);
+#endif
     return ESP_OK;
 }
 
@@ -1615,6 +1690,19 @@ void app_face_tap(void)
     s_face.click_pulse = 1.0f;
 }
 
+uint32_t app_face_next_frame_delay_ms(void)
+{
+    if (!s_face.initialized) return UINT32_MAX;
+    /* At native refresh rate the TE wait paces presentation. An independent
+     * 60 Hz software clock beats against the panel clock and drops frames. */
+    if (CONFIG_APP_FACE_FPS == 60) return 1;
+    uint32_t fps = CONFIG_APP_FACE_FPS > 0 ? CONFIG_APP_FACE_FPS : 30u;
+    uint64_t period_us = 1000000ULL / fps;
+    uint64_t elapsed_us = (uint64_t)esp_timer_get_time() - s_face.last_frame_us;
+    if (elapsed_us >= period_us) return 0;
+    return (uint32_t)((period_us - elapsed_us + 999ULL) / 1000ULL);
+}
+
 void app_face_tick(uint32_t now_ms)
 {
     (void)now_ms;
@@ -1625,16 +1713,29 @@ void app_face_tick(uint32_t now_ms)
     uint64_t frame_period_us = 1000000ULL / (uint64_t)fps;
     uint64_t frame_now_us = (uint64_t)esp_timer_get_time();
     uint64_t frame_elapsed_us = frame_now_us - s_face.last_frame_us;
-    if (frame_elapsed_us < frame_period_us) {
+    if (CONFIG_APP_FACE_FPS != 60 && frame_elapsed_us < frame_period_us) {
         return;
     }
     if (frame_elapsed_us >= frame_period_us * 2ULL) {
         s_face.stats_skipped_frames += (uint32_t)(frame_elapsed_us / frame_period_us) - 1u;
     }
-    s_face.last_frame_us = frame_now_us;
+    /* Keep the deadline on its original cadence. Resetting it to the actual
+     * start accumulates RTOS tick quantization and gradually loses frames.
+     * Advance past missed deadlines without rendering a catch-up burst. */
+    if (CONFIG_APP_FACE_FPS == 60) {
+        s_face.last_frame_us = frame_now_us;
+    } else {
+        s_face.last_frame_us += (frame_elapsed_us / frame_period_us) * frame_period_us;
+    }
     s_face.last_frame_ms = (uint32_t)(frame_now_us / 1000ULL);
+#if CONFIG_PM_ENABLE
+    if (s_render_cpu_lock) esp_pm_lock_acquire(s_render_cpu_lock);
+#endif
     update_runtime(s_face.last_frame_ms);
     render(s_face.last_frame_ms);
+#if CONFIG_PM_ENABLE
+    if (s_render_cpu_lock) esp_pm_lock_release(s_render_cpu_lock);
+#endif
 }
 
 #endif

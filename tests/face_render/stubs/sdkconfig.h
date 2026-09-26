@@ -1,0 +1,3 @@
+#pragma once
+#define CONFIG_APP_FACE_ENABLED 1
+#define CONFIG_APP_FACE_USE_IMU 0

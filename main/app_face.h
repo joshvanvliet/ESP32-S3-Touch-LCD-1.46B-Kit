@@ -34,6 +34,9 @@ void app_face_set_axes(float axis_x, float axis_y, float axis_z);
 void app_face_force_blink(void);
 void app_face_tap(void);
 void app_face_tick(uint32_t now_ms);
+/* Milliseconds until the next frame deadline, rounded up; UINT32_MAX if off.
+ * Call from the same task as app_face_tick(). Zero means a frame is due. */
+uint32_t app_face_next_frame_delay_ms(void);
 void app_face_set_protected_areas(const lv_area_t *areas, size_t count);
 void app_face_request_full_refresh(void);
 bool app_face_get_stats(app_face_stats_t *out_stats);

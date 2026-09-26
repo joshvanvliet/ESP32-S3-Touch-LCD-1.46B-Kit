@@ -10,6 +10,10 @@
 typedef bool (*app_lcd_blit_done_cb_t)(void *user);
 
 esp_err_t app_lcd_init(esp_lcd_panel_handle_t panel);
+esp_err_t app_lcd_te_init(int gpio_num);
+/* Wait for a fresh panel refresh edge, never a stale queued notification. */
+esp_err_t app_lcd_wait_frame_start(uint32_t timeout_ms);
+esp_err_t app_lcd_finish_frame(uint32_t timeout_ms);
 bool app_lcd_color_trans_done(esp_lcd_panel_io_handle_t panel_io,
                               esp_lcd_panel_io_event_data_t *edata,
                               void *user_ctx);

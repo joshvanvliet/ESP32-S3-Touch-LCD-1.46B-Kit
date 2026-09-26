@@ -104,9 +104,7 @@ static inline void blend_span(app_face_canvas_t *canvas, int y, int x1, int x2, 
     lv_color_t *row = &canvas->pixels[y * canvas->width];
     if (alpha >= 250) {
         lv_color_t fill = lv_color_make(color.r, color.g, color.b);
-        for (int x = x1; x <= x2; x++) {
-            row[x] = fill;
-        }
+        lv_color_fill(&row[x1], fill, (uint32_t)(x2 - x1 + 1));
         return;
     }
     for (int x = x1; x <= x2; x++) {
@@ -125,9 +123,7 @@ void app_face_canvas_init(app_face_canvas_t *canvas, lv_color_t *pixels, int wid
 void app_face_canvas_clear(app_face_canvas_t *canvas, app_face_rgb_t color)
 {
     lv_color_t lv_color = lv_color_make(color.r, color.g, color.b);
-    for (int i = 0; i < canvas->width * canvas->height; i++) {
-        canvas->pixels[i] = lv_color;
-    }
+    lv_color_fill(canvas->pixels, lv_color, (uint32_t)canvas->width * (uint32_t)canvas->height);
 }
 
 void app_face_canvas_restore_region(app_face_canvas_t *canvas,
@@ -145,6 +141,11 @@ void app_face_canvas_restore_region(app_face_canvas_t *canvas,
         return;
     }
     size_t count = (size_t)(x2 - x1 + 1) * sizeof(lv_color_t);
+    if (x1 == 0 && x2 == canvas->width - 1) {
+        memcpy(&canvas->pixels[y1 * canvas->width],
+               &source->pixels[y1 * source->width], count * (size_t)(y2 - y1 + 1));
+        return;
+    }
     for (int y = y1; y <= y2; y++) {
         memcpy(&canvas->pixels[y * canvas->width + x1],
                &source->pixels[y * source->width + x1],
